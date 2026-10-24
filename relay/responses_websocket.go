@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	appmodel "github.com/QuantumNous/new-api/model"
+	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
@@ -224,19 +225,40 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(create.Body))
 		c.Request.ContentLength = int64(len(create.Body))
-		return s.runCall(c, state, create)
+		return s.runCall(c, state, create, requestID)
 	})
 	if apiErr != nil && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
 		state.closeCode = websocket.ClosePolicyViolation
 	}
 }
 
-func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState, create responsesWSCreateRequest) (apiErr *types.NewAPIError) {
+func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState, create responsesWSCreateRequest, requestID string) (apiErr *types.NewAPIError) {
 	policy := service.RequestPolicy(c)
 	modelName := create.Request.Model
 	started := time.Now()
 	var info *relaycommon.RelayInfo
 	billingPrepared := false
+	attemptRecorded := false
+	markedRealRequests := make(map[string]struct{})
+	markRealRequest := func(info *relaycommon.RelayInfo) {
+		if info == nil || !channelstatus.IsConfigured() || !channelstatus.RedisAvailable() || info.UsingGroup == "" {
+			return
+		}
+		key := info.UsingGroup + "\x00" + info.OriginModelName
+		if _, exists := markedRealRequests[key]; exists {
+			return
+		}
+		// Use the actual registration time for probe suppression. info.StartTime
+		// is the request's original start time and may predate channel selection.
+		if err := channelstatus.MarkRequestStarted(info.UsingGroup, info.OriginModelName, info.TokenId, requestID, time.Now()); err == nil {
+			markedRealRequests[key] = struct{}{}
+		} else {
+			// EVAL may have committed before the client observed a timeout. An
+			// idempotent cleanup prevents a stale active marker from suppressing
+			// probes for its full TTL.
+			channelstatus.MarkRequestFinished(info.UsingGroup, info.OriginModelName, requestID)
+		}
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			apiErr = types.NewError(fmt.Errorf("responses websocket call panic: %v", recovered), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
@@ -246,6 +268,13 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
+		if !attemptRecorded {
+			channelstatus.RecordRelayResult(info, apiErr)
+		}
+		for key := range markedRealRequests {
+			group, model, _ := strings.Cut(key, "\x00")
+			channelstatus.MarkRequestFinished(group, model, requestID)
+		}
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
 		// so neither policy record belongs here.
@@ -277,6 +306,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			return apiErr
 		}
 		billingPrepared = true
+		markRealRequest(info)
 		var payload []byte
 		payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
 		if apiErr != nil {
@@ -289,6 +319,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	} else {
 		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
 		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
+			attemptRecorded = false
 			var channel *appmodel.Channel
 			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
 			if apiErr != nil {
@@ -309,6 +340,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					return apiErr
 				}
 			}
+			markRealRequest(info)
 			info.RetryIndex = retry.GetRetry()
 			policy.BeginAttempt(channel, info.UsingGroup)
 			var payload []byte
@@ -323,6 +355,8 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
 				service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
 				info.LastError = apiErr
+				channelstatus.RecordRelayResult(info, apiErr)
+				attemptRecorded = true
 				decision := service.DecideRelayRetry(c, apiErr, common.RetryTimes-retry.GetRetry())
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
 				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)

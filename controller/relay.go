@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
@@ -124,6 +125,27 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
+	markedRealRequests := make(map[string]struct{})
+	attemptRecorded := false
+	markRealRequest := func(info *relaycommon.RelayInfo) {
+		if info == nil || !channelstatus.IsConfigured() || !channelstatus.RedisAvailable() || info.UsingGroup == "" {
+			return
+		}
+		key := info.UsingGroup + "\x00" + info.OriginModelName
+		if _, exists := markedRealRequests[key]; exists {
+			return
+		}
+		// Use the actual registration time for probe suppression. info.StartTime
+		// is the request's original start time and may predate channel selection.
+		if err := channelstatus.MarkRequestStarted(info.UsingGroup, info.OriginModelName, info.TokenId, requestId, time.Now()); err == nil {
+			markedRealRequests[key] = struct{}{}
+		} else {
+			// EVAL may have committed before the client observed a timeout. An
+			// idempotent cleanup prevents a stale active marker from suppressing
+			// probes for its full TTL.
+			channelstatus.MarkRequestFinished(info.UsingGroup, info.OriginModelName, requestId)
+		}
+	}
 
 	defer func() {
 		recovered := recover()
@@ -133,6 +155,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
+		}
+		if !attemptRecorded {
+			channelstatus.RecordRelayResult(relayInfo, resultErr)
+		}
+		for key := range markedRealRequests {
+			group, model, _ := strings.Cut(key, "\x00")
+			channelstatus.MarkRequestFinished(group, model, requestId)
 		}
 		if recovered != nil {
 			panic(recovered)
@@ -157,6 +186,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+		attemptRecorded = false
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
@@ -172,6 +202,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = billingErr
 			break
 		}
+		markRealRequest(relayInfo)
 
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
@@ -197,6 +228,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			channelstatus.RecordRelayResult(relayInfo, nil)
+			attemptRecorded = true
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
 			relayInfo.LastError = nil
 			return
@@ -204,6 +237,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		channelstatus.RecordRelayResult(relayInfo, newAPIError)
+		attemptRecorded = true
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)

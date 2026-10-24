@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
@@ -21,6 +22,39 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(channelStatusProbeHandler{})
+}
+
+type channelStatusProbeHandler struct{}
+
+func (channelStatusProbeHandler) Type() string { return model.SystemTaskTypeChannelStatus }
+
+func (channelStatusProbeHandler) Enabled() bool {
+	targets, err := channelstatus.LoadTargets()
+	return err == nil && len(targets) > 0 && channelstatus.RedisAvailable()
+}
+
+func (channelStatusProbeHandler) Interval() time.Duration {
+	targets, err := channelstatus.LoadTargets()
+	if err != nil || len(targets) == 0 {
+		return time.Minute
+	}
+	interval := time.Duration(targets[0].IntervalSeconds) * time.Second
+	for _, target := range targets[1:] {
+		interval = min(interval, time.Duration(target.IntervalSeconds)*time.Second)
+	}
+	return interval
+}
+
+func (channelStatusProbeHandler) NewPayload() any { return nil }
+
+func (channelStatusProbeHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	err := channelstatus.ProbeAll(ctx)
+	if err != nil {
+		finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, nil, err)
+		return
+	}
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, nil, nil)
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and

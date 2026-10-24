@@ -23,6 +23,7 @@ import {
   CreditCard,
   FileText,
   FlaskConical,
+  HeartPulse,
   Key,
   LayoutDashboard,
   ListTodo,
@@ -31,6 +32,7 @@ import {
   Radio,
   ServerCog,
   Settings,
+  Settings2,
   ShieldCheck,
   Ticket,
   User,
@@ -89,6 +91,12 @@ export function useSidebarData(): SidebarData {
             icon: Key,
           },
           {
+            title: t('Service Status'),
+            url: '/channel-status',
+            configUrls: ['/channel-status/settings'],
+            icon: HeartPulse,
+          },
+          {
             title: t('Usage Logs'),
             url: '/usage-logs/common',
             icon: FileText,
@@ -136,6 +144,12 @@ export function useSidebarData(): SidebarData {
             title: t('Channels'),
             url: '/channels',
             icon: Radio,
+          },
+          {
+            title: t('Channel Status Settings'),
+            url: '/channel-status/settings',
+            icon: Settings2,
+            requiredRole: ROLE.ADMIN,
           },
           {
             title: t('Models'),

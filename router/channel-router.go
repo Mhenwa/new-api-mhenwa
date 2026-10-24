@@ -52,6 +52,10 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 	for _, route := range channelPermissionRoutes {
 		handlePermissionRoute(channelRoute, route.method, route.path, route.permission, route.handler)
 	}
+	// The frontend uses the canonical collection URL without a trailing slash.
+	// RedirectTrailingSlash is disabled for API routes, so keep an explicit alias
+	// for the collection GET instead of relying on Gin's redirect behavior.
+	handlePermissionRoute(channelRoute, http.MethodGet, "", authz.ChannelRead, controller.GetAllChannels)
 }
 
 var channelPermissionRoutes = []permissionRoute{

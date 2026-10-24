@@ -28,6 +28,13 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/status", controller.GetStatus)
 		apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
 		apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)
+		apiRouter.GET("/channel-status", middleware.DisableCache(), middleware.UserAuth(), controller.GetChannelStatus)
+		adminChannelStatusRoute := apiRouter.Group("/admin/channel-status")
+		adminChannelStatusRoute.Use(middleware.AdminAuth(), middleware.DisableCache())
+		{
+			adminChannelStatusRoute.GET("/targets", controller.GetChannelStatusMonitor)
+			adminChannelStatusRoute.PUT("/targets", controller.UpdateChannelStatusMonitor)
+		}
 		apiRouter.GET("/status/test", middleware.AdminAuth(), controller.TestStatus)
 		apiRouter.GET("/notice", controller.GetNotice)
 		apiRouter.GET("/user-agreement", controller.GetUserAgreement)
