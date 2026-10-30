@@ -23,6 +23,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
 	service.RegisterSystemTaskHandler(channelStatusProbeHandler{})
+	channelstatus.StartProbeScheduler()
 }
 
 type channelStatusProbeHandler struct{}
@@ -30,8 +31,9 @@ type channelStatusProbeHandler struct{}
 func (channelStatusProbeHandler) Type() string { return model.SystemTaskTypeChannelStatus }
 
 func (channelStatusProbeHandler) Enabled() bool {
-	targets, err := channelstatus.LoadTargets()
-	return err == nil && len(targets) > 0 && channelstatus.RedisAvailable()
+	// Keep the handler registered for an already queued legacy task, while
+	// independent idle scheduling replaces creation of serial whole-list runs.
+	return false
 }
 
 func (channelStatusProbeHandler) Interval() time.Duration {

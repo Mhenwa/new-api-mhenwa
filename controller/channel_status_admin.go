@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -34,6 +35,9 @@ func GetChannelStatusMonitor(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage(err.Error()))
 		return
 	}
+	if targets == nil {
+		targets = []channelstatus.Target{}
+	}
 	metadata, err := channelStatusMonitorMetadata()
 	if err != nil {
 		common.ApiError(c, err)
@@ -57,7 +61,8 @@ func GetChannelStatusMonitor(c *gin.Context) {
 // so no container restart is required.
 func UpdateChannelStatusMonitor(c *gin.Context) {
 	var request channelStatusMonitorRequest
-	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1024*1024+1))
+	if err != nil || len(body) > 1024*1024 || common.Unmarshal(body, &request) != nil || request.Targets == nil {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Invalid parameters"))
 		return
 	}
@@ -117,7 +122,7 @@ func channelStatusMonitorMetadata() (channelStatusMonitorMetadataResult, error) 
 	slices.Sort(groups)
 
 	var tokens []model.Token
-	if err := model.DB.Where("status = ? AND unlimited_quota = ? AND remain_quota > ? AND model_limits_enabled = ?", common.TokenStatusEnabled, false, 0, true).Find(&tokens).Error; err != nil {
+	if err := model.DB.Select([]string{"id", "name", "user_id", "group", "expired_time", "allow_ips", "model_limits"}).Where("status = ? AND unlimited_quota = ? AND remain_quota > ? AND model_limits_enabled = ?", common.TokenStatusEnabled, false, 0, true).Find(&tokens).Error; err != nil {
 		return channelStatusMonitorMetadataResult{}, err
 	}
 	probeTokens := make([]channelStatusProbeToken, 0, len(tokens))
@@ -127,7 +132,7 @@ func channelStatusMonitorMetadata() (channelStatusMonitorMetadataResult, error) 
 			continue
 		}
 		user, err := model.GetUserById(token.UserId, false)
-		if err != nil || user == nil || user.Status != common.UserStatusEnabled || model.IsAdmin(token.UserId) {
+		if err != nil || user == nil || user.Status != common.UserStatusEnabled || user.Role >= common.RoleAdminUser {
 			continue
 		}
 		ips := token.GetIpLimits()
@@ -141,7 +146,7 @@ func channelStatusMonitorMetadata() (channelStatusMonitorMetadataResult, error) 
 			}
 		}
 		slices.Sort(modelNames)
-		if len(modelNames) == 0 || !service.GroupInUserUsableGroups(user.Group, token.Group) {
+		if len(modelNames) == 0 || !service.IsUserSelectableGroup(user.Group, token.Group) {
 			continue
 		}
 		probeTokens = append(probeTokens, channelStatusProbeToken{Id: token.Id, Name: strings.TrimSpace(token.Name), UserId: token.UserId, Group: token.Group, Models: modelNames})

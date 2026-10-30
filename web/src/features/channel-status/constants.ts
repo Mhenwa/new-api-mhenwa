@@ -20,7 +20,7 @@ import {
   CircleAlert,
   CircleCheck,
   CircleHelp,
-  LoaderCircle,
+  Clock3,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -29,7 +29,7 @@ import type { ChannelStatus } from './types'
 export const CHANNEL_STATUS_ORDER: ChannelStatus[] = [
   'healthy',
   'error',
-  'probing',
+  'degraded',
   'no_data',
 ]
 
@@ -39,6 +39,6 @@ export const CHANNEL_STATUS_META: Record<
 > = {
   healthy: { icon: CircleCheck, variant: 'success' },
   error: { icon: CircleAlert, variant: 'danger' },
-  probing: { icon: LoaderCircle, variant: 'warning' },
+  degraded: { icon: Clock3, variant: 'warning' },
   no_data: { icon: CircleHelp, variant: 'neutral' },
 }

@@ -23,6 +23,13 @@ const { createInstance } = await import('i18next')
 const { I18nextProvider, initReactI18next } = await import('react-i18next')
 const { QueryClient, QueryClientProvider } =
   await import('@tanstack/react-query')
+const {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} = await import('@tanstack/react-router')
 const { api } = await import('@/lib/api')
 const { ApiKeysProvider } = await import('../api-keys-provider')
 const { ApiKeysMutateDrawer } = await import('../api-keys-mutate-drawer')
@@ -70,6 +77,35 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
           data: {
             success: true,
             data: { groups: ['vip', 'default'], max_count: 3 },
+          },
+        }
+      case '/api/channel-status':
+        return {
+          data: {
+            success: true,
+            data: {
+              updated_at: 1,
+              targets: [
+                {
+                  group: 'vip',
+                  model: 'chat',
+                  status: 'healthy',
+                  source: 'probe',
+                  history: {
+                    observations: [
+                      {
+                        id: 'vip-probe',
+                        source: 'probe',
+                        status: 'healthy',
+                        observed_at: 1,
+                        order_ms: 1,
+                      },
+                    ],
+                    real_samples: [],
+                  },
+                },
+              ],
+            },
           },
         }
       default:
@@ -121,12 +157,31 @@ async function renderCreateDrawer(): Promise<void> {
   )
   renderedDrawer = { queryClient }
 
+  const rootRoute = createRootRoute()
+  const keysRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/keys',
+    component: () => (
+      <ApiKeysProvider>
+        <ApiKeysMutateDrawer open onOpenChange={() => undefined} />
+      </ApiKeysProvider>
+    ),
+  })
+  const statusRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/channel-status',
+    component: () => <p>Group status destination</p>,
+  })
+  const router = createRouter({
+    routeTree: rootRoute.addChildren([keysRoute, statusRoute]),
+    history: createMemoryHistory({ initialEntries: ['/keys'] }),
+  })
+  await router.load()
+
   render(
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
-        <ApiKeysProvider>
-          <ApiKeysMutateDrawer open onOpenChange={() => undefined} />
-        </ApiKeysProvider>
+        <RouterProvider router={router} />
       </I18nextProvider>
     </QueryClientProvider>
   )
@@ -204,6 +259,24 @@ afterEach(() => {
 })
 
 describe('API keys mutate drawer Auto group integration', () => {
+  test('shows monitored group status and opens the group status page', async () => {
+    installApiFixtures([])
+    await renderCreateDrawer()
+
+    selectComboboxOption(getControlByLabel('Group'), 'Priority access')
+    expect(await screen.findByText('Healthy')).toBeInTheDocument()
+    expect(
+      await screen.findByText('Observed success rate: 100%')
+    ).toBeInTheDocument()
+
+    const statusLink = screen.getByRole('link', { name: 'View group status' })
+    expect(statusLink).toHaveAttribute('href', '/channel-status')
+    fireEvent.click(statusLink)
+    expect(
+      await screen.findByText('Group status destination')
+    ).toBeInTheDocument()
+  })
+
   test('inherits the root Auto order and sends an empty override for every batch-created key', async () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)

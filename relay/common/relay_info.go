@@ -80,6 +80,13 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// ChannelStatusOutputObserver receives read-only stream observations. It is
+// installed only for monitored targets and never controls relay processing.
+type ChannelStatusOutputObserver interface {
+	Observe(payload []byte, at time.Time)
+	Snapshot() (first, last time.Time, frames int)
+}
+
 type RelayInfo struct {
 	TokenId           int
 	TokenKey          string
@@ -91,6 +98,8 @@ type RelayInfo struct {
 	StartTime         time.Time
 	FirstResponseTime time.Time
 	isFirstResponse   bool
+
+	ChannelStatusOutput ChannelStatusOutputObserver
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool

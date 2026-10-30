@@ -18,7 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronDown, KeyRound, Settings2, WalletCards } from 'lucide-react'
+import { Link } from '@tanstack/react-router'
+import {
+  ChevronDown,
+  ExternalLink,
+  KeyRound,
+  Settings2,
+  WalletCards,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type SubmitErrorHandler } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -62,6 +69,8 @@ import {
 } from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { useChannelStatus } from '@/features/channel-status/hooks/use-channel-status'
+import { aggregateChannelStatusByGroup } from '@/features/channel-status/lib/group-status'
 import { RelatedPolicyLink } from '@/features/system-settings/request-policies/related-policy-link'
 import { useStatus } from '@/hooks/use-status'
 import { getUserModels, getUserGroups } from '@/lib/api'
@@ -111,6 +120,7 @@ export function ApiKeysMutateDrawer({
   const currentRowId = currentRow?.id
   const { triggerRefresh } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
+  const channelStatusQuery = useChannelStatus({ enabled: open })
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
@@ -161,6 +171,11 @@ export function ApiKeysMutateDrawer({
     staleTime: 0,
   })
 
+  const groupStatusMap = useMemo(
+    () => aggregateChannelStatusByGroup(channelStatusQuery.data?.targets ?? []),
+    [channelStatusQuery.data?.targets]
+  )
+
   const models = modelsData?.data || []
   const groups = useMemo<ApiKeyGroupOption[]>(
     () =>
@@ -169,8 +184,10 @@ export function ApiKeysMutateDrawer({
         label: key,
         desc: info.desc ? translateServerText(t, info.desc) : key,
         ratio: info.ratio,
+        status: groupStatusMap.get(key)?.status,
+        successRate: groupStatusMap.get(key)?.successRate,
       })),
-    [groupsData, t]
+    [groupStatusMap, groupsData, t]
   )
   const backendHasAuto = groups.some((g) => g.value === 'auto')
   const availableAutoGroupNames = useMemo(
@@ -424,7 +441,16 @@ export function ApiKeysMutateDrawer({
                 name='group'
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>{t('Group')}</FormLabel>
+                    <div className='flex items-center justify-between gap-2'>
+                      <FormLabel>{t('Group')}</FormLabel>
+                      <Link
+                        to='/channel-status'
+                        className='text-primary inline-flex items-center gap-1 text-xs font-normal hover:underline'
+                      >
+                        {t('View group status')}
+                        <ExternalLink className='size-3.5' aria-hidden='true' />
+                      </Link>
+                    </div>
                     <FormControl>
                       <ApiKeyGroupCombobox
                         options={groups}

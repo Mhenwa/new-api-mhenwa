@@ -34,7 +34,9 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import type { ChannelStatus } from '@/features/channel-status/types'
 import { useMediaQuery } from '@/hooks'
+import { toIntlLocale } from '@/i18n/languages'
 import { cn } from '@/lib/utils'
 
 import {
@@ -48,6 +50,8 @@ export type ApiKeyGroupOption = {
   label: string
   desc?: string
   ratio?: number | string
+  status?: ChannelStatus
+  successRate?: number
 }
 
 type ApiKeyGroupComboboxProps = {
@@ -56,6 +60,55 @@ type ApiKeyGroupComboboxProps = {
   onValueChange: (value: string) => void
   placeholder?: string
   disabled?: boolean
+}
+
+const statusLabels: Record<ChannelStatus, string> = {
+  healthy: 'Healthy',
+  degraded: 'High latency',
+  error: 'Error',
+  no_data: 'No data',
+}
+
+const statusTextClasses: Record<ChannelStatus, string> = {
+  healthy: 'text-success',
+  degraded: 'text-warning',
+  error: 'text-destructive',
+  no_data: 'text-muted-foreground',
+}
+
+function GroupStatusLine({
+  status,
+  successRate,
+}: Pick<ApiKeyGroupOption, 'status' | 'successRate'>) {
+  const { t, i18n } = useTranslation()
+  if (!status) return null
+
+  const formattedRate =
+    successRate == null || !Number.isFinite(successRate)
+      ? t('No data')
+      : `${new Intl.NumberFormat(
+          toIntlLocale(i18n.resolvedLanguage || i18n.language),
+          { maximumFractionDigits: 1 }
+        ).format(successRate)}%`
+
+  return (
+    <span className='mt-0.5 flex min-w-0 items-center gap-1 text-[10px] leading-tight sm:text-[11px]'>
+      <span
+        className={cn(
+          'size-1.5 shrink-0 rounded-full bg-current',
+          statusTextClasses[status]
+        )}
+        aria-hidden='true'
+      />
+      <span className={cn('truncate', statusTextClasses[status])}>
+        {t(statusLabels[status])}
+      </span>
+      <span className='text-muted-foreground shrink-0'>·</span>
+      <span className='text-muted-foreground truncate'>
+        {t('Observed success rate')}: {formattedRate}
+      </span>
+    </span>
+  )
 }
 
 export function ApiKeyGroupCombobox({
@@ -128,6 +181,10 @@ export function ApiKeyGroupCombobox({
                 {selectedOption.desc}
               </span>
             )}
+            <GroupStatusLine
+              status={selectedOption?.status}
+              successRate={selectedOption?.successRate}
+            />
           </span>
           <span className='hidden sm:block'>
             <GroupRatioBadge
@@ -196,6 +253,10 @@ export function ApiKeyGroupCombobox({
                           {option.desc}
                         </span>
                       )}
+                      <GroupStatusLine
+                        status={option.status}
+                        successRate={option.successRate}
+                      />
                     </span>
                     <GroupRatioBadge
                       ratio={option.ratio}

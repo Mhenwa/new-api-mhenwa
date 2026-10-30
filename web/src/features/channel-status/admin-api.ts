@@ -30,9 +30,12 @@ type ChannelStatusMonitorResponse = {
   data?: ChannelStatusMonitorData
 }
 
-export async function getChannelStatusMonitor(): Promise<ChannelStatusMonitorResponse> {
+export async function getChannelStatusMonitor(
+  signal?: AbortSignal
+): Promise<ChannelStatusMonitorResponse> {
   const response = await api.get<ChannelStatusMonitorResponse>(
-    '/api/admin/channel-status/targets'
+    '/api/admin/channel-status/targets',
+    { signal, disableDuplicate: true }
   )
   return response.data
 }

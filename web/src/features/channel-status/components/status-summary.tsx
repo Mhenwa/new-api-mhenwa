@@ -16,50 +16,79 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Activity, CircleCheck, Radio, ShieldCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import { StatusBadge } from '@/components/status-badge'
+import { Card, CardContent } from '@/components/ui/card'
+import { IconBadge } from '@/components/ui/icon-badge'
+import { formatNumber } from '@/lib/format'
 
-import { CHANNEL_STATUS_META, CHANNEL_STATUS_ORDER } from '../constants'
-import type { ChannelStatus, ChannelStatusTarget } from '../types'
+import type { ChannelStatusTarget } from '../types'
 
-export function StatusSummary(props: { targets: ChannelStatusTarget[] }) {
+export function StatusSummary(props: {
+  targets: ChannelStatusTarget[]
+  locale?: string
+}) {
   const { t } = useTranslation()
-  const counts: Record<ChannelStatus, number> = {
-    healthy: 0,
-    error: 0,
-    probing: 0,
-    no_data: 0,
+  const healthy = props.targets.filter(
+    (target) => target.status === 'healthy'
+  ).length
+  const needsAttention = props.targets.some(
+    (target) => target.status === 'error' || target.status === 'degraded'
+  )
+  let headline = t('Waiting for observations')
+  let icon = Radio
+  let tone = 'neutral' as 'neutral' | 'success' | 'warning'
+  if (needsAttention) {
+    headline = t('Some routes need attention')
+    icon = Activity
+    tone = 'warning'
+  } else if (healthy === props.targets.length && healthy > 0) {
+    headline = t('All monitored routes are healthy')
+    icon = ShieldCheck
+    tone = 'success'
   }
-  const labels: Record<ChannelStatus, string> = {
-    healthy: t('Healthy'),
-    error: t('Error'),
-    probing: t('Probing'),
-    no_data: t('No data'),
-  }
-  for (const target of props.targets) counts[target.status] += 1
+  const OverallIcon = icon
 
   return (
-    <div
-      className='flex flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2.5 sm:px-4'
-      aria-label={t('Status summary')}
-    >
-      <span className='text-muted-foreground text-xs'>
-        {t('{{count}} routes', { count: props.targets.length })}
-      </span>
-      {CHANNEL_STATUS_ORDER.map((status) => {
-        const meta = CHANNEL_STATUS_META[status]
-        return (
-          <StatusBadge
-            key={status}
-            label={`${labels[status]} ${counts[status]}`}
-            icon={meta.icon}
-            variant={meta.variant}
-            copyable={false}
-            className='text-xs'
-          />
-        )
-      })}
-    </div>
+    <section aria-label={t('Status summary')} className='space-y-4'>
+      <Card className='relative gap-0 overflow-hidden border-0 py-0 shadow-none'>
+        <div
+          className='bg-primary/4 pointer-events-none absolute inset-y-0 right-0 w-1/3 rounded-l-full'
+          aria-hidden='true'
+        />
+        <CardContent className='relative flex flex-col gap-5 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6'>
+          <div className='flex min-w-0 items-start gap-3.5 sm:items-center'>
+            <IconBadge size='lg' tone={tone} className='size-12 rounded-2xl'>
+              <OverallIcon />
+            </IconBadge>
+            <div className='min-w-0'>
+              <p className='text-muted-foreground mb-1 text-[11px] font-semibold tracking-widest uppercase'>
+                {t('Live route monitoring')}
+              </p>
+              <h3 className='text-lg font-semibold tracking-tight sm:text-xl'>
+                {headline}
+              </h3>
+              <p className='text-muted-foreground mt-1.5 max-w-xl text-xs leading-relaxed sm:text-sm'>
+                {t('Real traffic is preferred; probes fill idle periods.')}
+              </p>
+            </div>
+          </div>
+          <div className='bg-background/80 flex h-auto items-center justify-start gap-3 rounded-xl border px-4 py-3 sm:min-w-36'>
+            <IconBadge tone='primary' size='md'>
+              <CircleCheck />
+            </IconBadge>
+            <span className='text-left'>
+              <span className='block font-mono text-xl font-semibold tabular-nums'>
+                {formatNumber(props.targets.length, props.locale)}
+              </span>
+              <span className='text-muted-foreground block text-xs'>
+                {t('Monitored routes')}
+              </span>
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+    </section>
   )
 }

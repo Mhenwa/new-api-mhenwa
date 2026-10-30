@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -1008,6 +1009,20 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newResponsesWSBillingTest(t, `tier("request", fixed(0.002))`, func(*websocket.Conn, *http.Request) {})
+			t.Setenv(channelstatus.TargetsEnv, `[{"group":"default","model":"ws-billing","probe_token_id":999999}]`)
+			common.OptionMapRWMutex.Lock()
+			previousTargets, previousTargetsExist := common.OptionMap[channelstatus.TargetsOption]
+			delete(common.OptionMap, channelstatus.TargetsOption)
+			common.OptionMapRWMutex.Unlock()
+			t.Cleanup(func() {
+				common.OptionMapRWMutex.Lock()
+				defer common.OptionMapRWMutex.Unlock()
+				if previousTargetsExist {
+					common.OptionMap[channelstatus.TargetsOption] = previousTargets
+				} else {
+					delete(common.OptionMap, channelstatus.TargetsOption)
+				}
+			})
 			oldRetries := common.RetryTimes
 			common.RetryTimes = 1
 			t.Cleanup(func() { common.RetryTimes = oldRetries })
@@ -1048,7 +1063,23 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 				keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
 				require.NoError(t, err)
 				assert.Empty(t, keys)
+				history, err := channelstatus.GetTargetHistory(context.Background(), channelstatus.Target{Group: "default", Model: "ws-billing"}, 3600, time.Now())
+				require.NoError(t, err)
+				assert.Empty(t, history.Observations, "business rejections are not service failures")
 				return
+			}
+			var monitorHistory channelstatus.TargetHistory
+			require.Eventually(t, func() bool {
+				var err error
+				monitorHistory, err = channelstatus.GetTargetHistory(context.Background(), channelstatus.Target{Group: "default", Model: "ws-billing"}, 3600, time.Now())
+				return err == nil && len(monitorHistory.Observations) == 1
+			}, time.Second, time.Millisecond)
+			require.Len(t, monitorHistory.RealSamples, 1, "one client request creates one bar, including a successful retry")
+			assert.Equal(t, "real", monitorHistory.Observations[0].Source)
+			if tc.success {
+				assert.Equal(t, "degraded", monitorHistory.Observations[0].Status, "the final non-stream success has unknown first-token timing; a failed retry must not replace it")
+			} else {
+				assert.Equal(t, "error", monitorHistory.Observations[0].Status)
 			}
 			requests, successes := waitPerfCounters(t, 1)
 			assert.Equal(t, int64(1), requests)

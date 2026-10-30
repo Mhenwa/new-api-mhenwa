@@ -126,8 +126,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 	markedRealRequests := make(map[string]struct{})
-	attemptRecorded := false
 	markRealRequest := func(info *relaycommon.RelayInfo) {
+		channelstatus.AttachRelayObserver(info)
 		if info == nil || !channelstatus.IsConfigured() || !channelstatus.RedisAvailable() || info.UsingGroup == "" {
 			return
 		}
@@ -156,9 +156,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
 		}
-		if !attemptRecorded {
-			channelstatus.RecordRelayResult(relayInfo, resultErr)
-		}
+		channelstatus.RecordRelayResult(relayInfo, resultErr)
 		for key := range markedRealRequests {
 			group, model, _ := strings.Cut(key, "\x00")
 			channelstatus.MarkRequestFinished(group, model, requestId)
@@ -186,7 +184,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.LastError = nil
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
-		attemptRecorded = false
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
@@ -228,8 +225,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
-			channelstatus.RecordRelayResult(relayInfo, nil)
-			attemptRecorded = true
 			service.MarkRequestPolicySuccess(c, relayInfo.StreamStatus)
 			relayInfo.LastError = nil
 			return
@@ -237,8 +232,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
-		channelstatus.RecordRelayResult(relayInfo, newAPIError)
-		attemptRecorded = true
 
 		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)

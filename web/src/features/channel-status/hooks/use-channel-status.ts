@@ -24,7 +24,7 @@ import { getChannelStatus } from '../api'
 
 export const channelStatusQueryKey = ['channel-status'] as const
 
-export function useChannelStatus() {
+export function useChannelStatus(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: channelStatusQueryKey,
     queryFn: async ({ signal }) => {
@@ -32,6 +32,7 @@ export function useChannelStatus() {
       if (!response.data) throw new Error('Missing channel status data')
       return response.data
     },
+    enabled: options?.enabled ?? true,
     staleTime: 15_000,
     refetchInterval: 30_000,
   })

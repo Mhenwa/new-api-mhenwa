@@ -16,8 +16,46 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import {
+  getFirstResponseTimeColor,
+  getResponseTimeColor,
+} from '@/features/usage-logs/lib/format'
+
+import type { ChannelStatusTarget } from '../types'
+
+export function getObservationMetricColors(
+  target: Pick<ChannelStatusTarget, 'ttft_ms' | 'latency_ms' | 'output_tokens'>
+): { firstToken: string; totalTime: string } {
+  let firstToken = 'text-muted-foreground'
+  let totalTime = 'text-muted-foreground'
+  if (
+    target.ttft_ms != null &&
+    Number.isFinite(target.ttft_ms) &&
+    target.ttft_ms > 0
+  ) {
+    firstToken =
+      getFirstResponseTimeColor(target.ttft_ms / 1000) === 'danger'
+        ? 'text-warning'
+        : 'text-success'
+  }
+  if (
+    target.latency_ms != null &&
+    Number.isFinite(target.latency_ms) &&
+    target.latency_ms > 0
+  ) {
+    totalTime =
+      getResponseTimeColor(
+        target.latency_ms / 1000,
+        target.output_tokens ?? 0
+      ) === 'danger'
+        ? 'text-warning'
+        : 'text-success'
+  }
+  return { firstToken, totalTime }
+}
+
 export function formatDuration(value: number | undefined): string {
-  if (value == null || !Number.isFinite(value) || value < 0) return '-'
+  if (value == null || !Number.isFinite(value) || value <= 0) return '—'
   if (value < 1000) return `${Math.round(value)} ms`
   return `${(value / 1000).toFixed(2)} s`
 }
@@ -34,6 +72,14 @@ export function formatTimestamp(
 }
 
 export function formatThroughput(value: number | undefined): string {
-  if (value == null || !Number.isFinite(value) || value < 0) return '-'
+  if (value == null || !Number.isFinite(value) || value < 0) return '—'
   return `${value.toFixed(1)} tok/s`
+}
+
+export function formatRatio(
+  value: number | undefined,
+  locale: string | undefined
+): string {
+  if (value == null || !Number.isFinite(value) || value < 0) return '—'
+  return `×${new Intl.NumberFormat(locale, { maximumFractionDigits: 4 }).format(value)}`
 }

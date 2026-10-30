@@ -238,9 +238,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	started := time.Now()
 	var info *relaycommon.RelayInfo
 	billingPrepared := false
-	attemptRecorded := false
 	markedRealRequests := make(map[string]struct{})
 	markRealRequest := func(info *relaycommon.RelayInfo) {
+		channelstatus.AttachRelayObserver(info)
 		if info == nil || !channelstatus.IsConfigured() || !channelstatus.RedisAvailable() || info.UsingGroup == "" {
 			return
 		}
@@ -268,9 +268,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
-		if !attemptRecorded {
-			channelstatus.RecordRelayResult(info, apiErr)
-		}
+		channelstatus.RecordRelayResult(info, apiErr)
 		for key := range markedRealRequests {
 			group, model, _ := strings.Cut(key, "\x00")
 			channelstatus.MarkRequestFinished(group, model, requestID)
@@ -319,7 +317,6 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	} else {
 		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
 		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
-			attemptRecorded = false
 			var channel *appmodel.Channel
 			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
 			if apiErr != nil {
@@ -355,8 +352,6 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				apiErr = service.NormalizeViolationFeeError(types.NewError(dialErr, types.ErrorCodeDoRequestFailed))
 				service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
 				info.LastError = apiErr
-				channelstatus.RecordRelayResult(info, apiErr)
-				attemptRecorded = true
 				decision := service.DecideRelayRetry(c, apiErr, common.RetryTimes-retry.GetRetry())
 				service.RecordPolicyFailure(c, channel.Id, apiErr, decision)
 				service.ProcessChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, info.ApiKey, channel.GetAutoBan()), apiErr, info)
@@ -495,6 +490,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					if event.Response != nil && event.Response.ID != "" {
 						responseID = event.Response.ID
 					}
+				}
+				if info.ChannelStatusOutput != nil {
+					info.ChannelStatusOutput.Observe(incoming.body, time.Now())
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
 			}

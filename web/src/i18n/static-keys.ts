@@ -735,6 +735,7 @@ export const STATIC_I18N_KEYS = [
   'View audit records from user and admin roles. Root records are always excluded.',
   'Updated channel status (ID: {{id}})',
   'Batch updated channel status ({{count}}/{{total}} changed)',
+  'View group status',
 
   // Misc
   'Cancel',

@@ -2,11 +2,11 @@ package channelstatus
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -17,14 +17,18 @@ import (
 const sampleTTL = 24 * time.Hour
 
 type Sample struct {
-	Status     string  `json:"status"`
-	Source     string  `json:"source"`
-	ObservedAt int64   `json:"observed_at"`
-	OrderMS    int64   `json:"order_ms"`
-	StartedAt  int64   `json:"request_started_at,omitempty"`
-	TTFTMs     int64   `json:"ttft_ms,omitempty"`
-	LatencyMs  int64   `json:"latency_ms,omitempty"`
-	TPS        float64 `json:"tps,omitempty"`
+	ID                string  `json:"id,omitempty"`
+	Status            string  `json:"status"`
+	Source            string  `json:"source"`
+	ObservedAt        int64   `json:"observed_at"`
+	OrderMS           int64   `json:"order_ms"`
+	StartedAt         int64   `json:"request_started_at,omitempty"`
+	TTFTMs            int64   `json:"ttft_ms,omitempty"`
+	LatencyMs         int64   `json:"latency_ms,omitempty"`
+	TPS               float64 `json:"tps,omitempty"`
+	OutputTokens      *int64  `json:"output_tokens"`
+	OutputRateVersion int     `json:"output_rate_version,omitempty"`
+	activeRequestID   string
 }
 
 type TargetStatus struct {
@@ -37,6 +41,7 @@ type TargetStatus struct {
 	TTFTMs           int64   `json:"ttft_ms,omitempty"`
 	LatencyMs        int64   `json:"latency_ms,omitempty"`
 	TPS              float64 `json:"tps,omitempty"`
+	OutputTokens     *int64  `json:"output_tokens"`
 }
 
 var maxStartScript = redis.NewScript(`
@@ -57,14 +62,80 @@ return 1
 `)
 
 var newerSampleScript = redis.NewScript(`
+if ARGV[5] == 'real' and ARGV[7] ~= '' then
+  redis.call('ZREM', KEYS[6], ARGV[7])
+end
 local current = redis.call('GET', KEYS[1])
+local updateLatest = true
 if current then
   local ok, decoded = pcall(cjson.decode, current)
   if ok and tonumber(decoded['order_ms'] or 0) > tonumber(ARGV[2]) then
-    return 0
+    updateLatest = false
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+local sample = cjson.decode(ARGV[1])
+local minute = math.floor(tonumber(sample['observed_at'] or 0) / 60)
+local nowMinute = tonumber(ARGV[4])
+local status = sample['status']
+local source = ARGV[5]
+if minute < nowMinute - 1439 or minute > nowMinute or
+   (status ~= 'healthy' and status ~= 'degraded' and status ~= 'error') or
+   (source ~= 'real' and source ~= 'probe') then
+  if updateLatest then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3]) end
+  return 1
+end
+local slot = tostring(minute % 1440)
+local stored = redis.call('HGET', KEYS[2], slot)
+local bucket = nil
+if stored then
+  local ok, decoded = pcall(cjson.decode, stored)
+  if not ok then return redis.error_reply('invalid channel status history bucket') end
+  if tonumber(decoded['minute']) > minute then
+    if updateLatest then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3]) end
+    return 1
+  end
+  if tonumber(decoded['minute']) == minute then bucket = decoded end
+end
+if not bucket then
+  bucket = {minute=minute, success=0, error=0, degraded=0, real=0, probe=0,
+            ttft_sum=0, ttft_count=0, real_ttft_sum=0, real_ttft_count=0}
+end
+local id = sample['id']
+if redis.call('HEXISTS', KEYS[5], id) == 1 then return 0 end
+if status == 'healthy' or status == 'degraded' then bucket['success'] = bucket['success'] + 1
+else bucket['error'] = bucket['error'] + 1 end
+if status == 'degraded' then bucket['degraded'] = (bucket['degraded'] or 0) + 1 end
+bucket[source] = bucket[source] + 1
+local ttft = tonumber(sample['ttft_ms'] or 0)
+if ttft > 0 then
+  bucket['ttft_sum'] = bucket['ttft_sum'] + ttft
+  bucket['ttft_count'] = bucket['ttft_count'] + 1
+  if source == 'real' then
+    bucket['real_ttft_sum'] = bucket['real_ttft_sum'] + ttft
+    bucket['real_ttft_count'] = bucket['real_ttft_count'] + 1
+  end
+end
+if updateLatest then
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+end
+redis.call('HSET', KEYS[2], slot, cjson.encode(bucket))
+redis.call('EXPIRE', KEYS[2], ARGV[6])
+redis.call('HSET', KEYS[5], id, ARGV[1])
+redis.call('ZADD', KEYS[3], ARGV[2], id)
+if source == 'real' then redis.call('ZADD', KEYS[4], ARGV[2], id) end
+local removed = redis.call('ZRANGE', KEYS[3], 0, -61)
+redis.call('ZREMRANGEBYRANK', KEYS[3], 0, -61)
+local removedReal = redis.call('ZRANGE', KEYS[4], 0, -31)
+redis.call('ZREMRANGEBYRANK', KEYS[4], 0, -31)
+for _, member in ipairs(removedReal) do table.insert(removed, member) end
+for _, member in ipairs(removed) do
+  if not redis.call('ZSCORE', KEYS[3], member) and not redis.call('ZSCORE', KEYS[4], member) then
+    redis.call('HDEL', KEYS[5], member)
+  end
+end
+redis.call('EXPIRE', KEYS[3], ARGV[6])
+redis.call('EXPIRE', KEYS[4], ARGV[6])
+redis.call('EXPIRE', KEYS[5], ARGV[6])
 return 1
 `)
 
@@ -73,7 +144,8 @@ func RedisAvailable() bool {
 }
 
 func IsConfigured() bool {
-	return strings.TrimSpace(os.Getenv(TargetsEnv)) != ""
+	targets, err := LoadTargets()
+	return err == nil && len(targets) > 0
 }
 
 func MarkRequestStarted(group, model string, tokenID int, requestID string, at time.Time) error {
@@ -90,7 +162,7 @@ func MarkRequestStarted(group, model string, tokenID int, requestID string, at t
 	if requestID == "" {
 		return errors.New("channel status request ID is required")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	startKey := redisKey(group, model, "real-start")
 	activeKey := redisKey(group, model, "real-active")
@@ -121,18 +193,22 @@ func MarkRequestFinished(group, model, requestID string) {
 	if !RedisAvailable() || requestID == "" {
 		return
 	}
-	targets, err := LoadTargets()
-	if err != nil {
-		return
-	}
-	if _, ok := findTarget(targets, group, model); !ok {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	if err := common.RDB.ZRem(ctx, redisKey(group, model, "real-active"), requestID).Err(); err != nil {
+	// The caller retains the groups/models it registered. Cleanup must survive
+	// an administrator removing a target while its request is still running.
+	client := common.RDB
+	key := redisKey(group, model, "real-active")
+	gopool.Go(func() {
+		var err error
+		for range 2 {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err = client.ZRem(ctx, key, requestID).Err()
+			cancel()
+			if err == nil {
+				return
+			}
+		}
 		common.SysLog(common.LogText("channel status active request cleanup failed: %v", err))
-	}
+	})
 }
 
 func RecordProbeSample(group, model string, sample Sample) error {
@@ -144,6 +220,15 @@ func RecordProbeSample(group, model string, sample Sample) error {
 }
 
 func writeSample(parent context.Context, group, model, source string, sample Sample) error {
+	sample.Source = source
+	sample.Status = classifySampleStatus(sample)
+	if sample.ID == "" {
+		var identity [16]byte
+		if _, err := rand.Read(identity[:]); err != nil {
+			return err
+		}
+		sample.ID = hex.EncodeToString(identity[:])
+	}
 	if sample.OrderMS == 0 {
 		sample.OrderMS = sample.ObservedAt * 1000
 	}
@@ -153,7 +238,16 @@ func writeSample(parent context.Context, group, model, source string, sample Sam
 	}
 	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
-	return newerSampleScript.Run(ctx, common.RDB, []string{redisKey(group, model, source)}, data, sample.OrderMS, int64(sampleTTL.Seconds())).Err()
+	// Real samples already enter here through the asynchronous recording queue.
+	// One bounded Lua operation retains the latest 60 observations and 30 real
+	// samples independently. The minute ring remains for existing clients and
+	// rollback; no aggregated or latest-only data is backfilled as raw samples.
+	return newerSampleScript.Run(ctx, common.RDB, []string{
+		redisKey(group, model, source), redisKey(group, model, "history"),
+		redisKey(group, model, "observations"), redisKey(group, model, "real-samples"),
+		redisKey(group, model, "observation-data"),
+		redisKey(group, model, "real-active"),
+	}, data, sample.OrderMS, int64(sampleTTL.Seconds()), time.Now().Unix()/60, source, int64((sampleTTL + time.Hour).Seconds()), sample.activeRequestID).Err()
 }
 
 func GetTargetStatus(ctx context.Context, target Target) (TargetStatus, error) {
@@ -174,19 +268,7 @@ func GetTargetStatus(ctx context.Context, target Target) (TargetStatus, error) {
 	if err != nil {
 		return TargetStatus{}, err
 	}
-	activeRequests, err := common.RDB.ZRevRangeWithScores(ctx, redisKey(target.Group, target.Model, "real-active"), 0, 0).Result()
-	if err != nil {
-		return TargetStatus{}, err
-	}
-	activeAt := int64(0)
-	if len(activeRequests) > 0 {
-		activeAt = int64(activeRequests[0].Score)
-	}
-	status := resolveTargetStatus(target, real, probe, activeAt)
-	if status.Status != "probing" && status.ObservedAt > 0 && target.IntervalSeconds > 0 && time.Now().Unix()-status.ObservedAt > int64(2*target.IntervalSeconds) {
-		status.Status = "no_data"
-	}
-	return status, nil
+	return resolveTargetStatus(target, real, probe), nil
 }
 
 func readSample(ctx context.Context, group, model, source string) (*Sample, error) {
@@ -204,7 +286,7 @@ func readSample(ctx context.Context, group, model, source string) (*Sample, erro
 	return &sample, nil
 }
 
-func resolveTargetStatus(target Target, real, probe *Sample, latestActiveAt int64) TargetStatus {
+func resolveTargetStatus(target Target, real, probe *Sample) TargetStatus {
 	result := TargetStatus{Group: target.Group, Model: target.Model, Status: "no_data", Source: "none"}
 	latestObserved := int64(0)
 	if real != nil && sampleOrderMS(real) > latestObserved {
@@ -215,12 +297,34 @@ func resolveTargetStatus(target Target, real, probe *Sample, latestActiveAt int6
 		latestObserved = sampleOrderMS(probe)
 		result = statusFromSample(target, probe)
 	}
-	if latestActiveAt >= latestObserved && latestActiveAt > 0 {
-		result.Status = "probing"
-		result.Source = "real"
-		result.RequestStartedAt = latestActiveAt / 1000
-	}
 	return result
+}
+
+// Availability uses the same danger thresholds as the usage-log timing badges.
+// A successful observation with missing timing stays degraded, not no_data;
+// output tokens absent in a legacy sample use the log's short-response branch.
+func classifySampleStatus(sample Sample) string {
+	if sample.Status == "error" || sample.Status == "degraded" {
+		return sample.Status
+	}
+	if sample.Status != "healthy" {
+		return "no_data"
+	}
+	if sample.TTFTMs <= 0 || sample.LatencyMs <= 0 || sample.TTFTMs >= 10_000 {
+		return "degraded"
+	}
+	outputTokens := int64(0)
+	if sample.OutputTokens != nil {
+		outputTokens = max(int64(0), *sample.OutputTokens)
+	}
+	if outputTokens < 100 {
+		if sample.LatencyMs >= 30_000 {
+			return "degraded"
+		}
+	} else if float64(outputTokens)/(float64(sample.LatencyMs)/1_000) < 15 {
+		return "degraded"
+	}
+	return "healthy"
 }
 
 func sampleOrderMS(sample *Sample) int64 {
@@ -234,10 +338,14 @@ func sampleOrderMS(sample *Sample) int64 {
 }
 
 func statusFromSample(target Target, sample *Sample) TargetStatus {
+	tps := float64(0)
+	if sample.OutputRateVersion == outputRateVersion {
+		tps = sample.TPS
+	}
 	return TargetStatus{
-		Group: target.Group, Model: target.Model, Status: sample.Status, Source: sample.Source,
+		Group: target.Group, Model: target.Model, Status: classifySampleStatus(*sample), Source: sample.Source,
 		ObservedAt: sample.ObservedAt, RequestStartedAt: sample.StartedAt,
-		TTFTMs: sample.TTFTMs, LatencyMs: sample.LatencyMs, TPS: sample.TPS,
+		TTFTMs: sample.TTFTMs, LatencyMs: sample.LatencyMs, TPS: tps, OutputTokens: sample.OutputTokens,
 	}
 }
 

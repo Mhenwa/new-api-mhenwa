@@ -16,9 +16,28 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-export type ChannelStatus = 'healthy' | 'error' | 'probing' | 'no_data'
+export type ChannelStatus = 'healthy' | 'degraded' | 'error' | 'no_data'
 
 export type ChannelStatusSource = 'real' | 'probe' | 'none'
+
+export interface ChannelObservation {
+  id: string
+  source: 'real' | 'probe'
+  status: 'healthy' | 'degraded' | 'error'
+  observed_at: number
+  order_ms: number
+  request_started_at?: number
+  ttft_ms?: number
+  latency_ms?: number
+  output_tokens?: number
+}
+
+export interface ChannelHistory {
+  observation_limit: number
+  real_sample_limit: number
+  observations: ChannelObservation[]
+  real_samples: ChannelObservation[]
+}
 
 export interface ChannelStatusTarget {
   group: string
@@ -30,6 +49,9 @@ export interface ChannelStatusTarget {
   ttft_ms?: number
   latency_ms?: number
   tps?: number
+  output_tokens?: number
+  effective_ratio?: number
+  history?: ChannelHistory
 }
 
 export interface ChannelStatusData {

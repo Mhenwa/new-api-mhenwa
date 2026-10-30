@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Clock3, Gauge, Timer } from 'lucide-react'
+import { Clock3, Coins, Timer } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { StatusBadge } from '@/components/status-badge'
@@ -32,8 +32,9 @@ import {
 import { CHANNEL_STATUS_META } from '../constants'
 import {
   formatDuration,
-  formatThroughput,
+  formatRatio,
   formatTimestamp,
+  getObservationMetricColors,
 } from '../lib/format'
 import type { ChannelStatusTarget } from '../types'
 
@@ -43,10 +44,11 @@ function StatusRow(props: {
 }) {
   const { t } = useTranslation()
   const meta = CHANNEL_STATUS_META[props.target.status]
+  const metricColors = getObservationMetricColors(props.target)
   const labels = {
     healthy: t('Healthy'),
     error: t('Error'),
-    probing: t('Probing'),
+    degraded: t('High latency'),
     no_data: t('No data'),
   }
   let source = t('Not observed')
@@ -64,16 +66,26 @@ function StatusRow(props: {
       <TableCell>
         <StatusBadge
           label={labels[props.target.status]}
+          title={
+            props.target.status === 'degraded'
+              ? t('Latency data is incomplete or latency is high.')
+              : undefined
+          }
           icon={meta.icon}
           variant={meta.variant}
-          pulse={props.target.status === 'probing'}
           copyable={false}
         />
       </TableCell>
       <TableCell className='text-muted-foreground'>{source}</TableCell>
-      <TableCell>{formatDuration(props.target.ttft_ms)}</TableCell>
-      <TableCell>{formatDuration(props.target.latency_ms)}</TableCell>
-      <TableCell>{formatThroughput(props.target.tps)}</TableCell>
+      <TableCell className={metricColors.firstToken}>
+        {formatDuration(props.target.ttft_ms)}
+      </TableCell>
+      <TableCell className={metricColors.totalTime}>
+        {formatDuration(props.target.latency_ms)}
+      </TableCell>
+      <TableCell>
+        {formatRatio(props.target.effective_ratio, props.locale)}
+      </TableCell>
       <TableCell className='text-muted-foreground text-xs'>
         {formatTimestamp(observedTime, props.locale)}
       </TableCell>
@@ -109,8 +121,8 @@ export function StatusTable(props: {
           </TableHead>
           <TableHead>
             <span className='inline-flex items-center gap-1'>
-              <Gauge className='size-3.5' aria-hidden='true' />
-              {t('Output speed')}
+              <Coins className='size-3.5' aria-hidden='true' />
+              {t('Effective rate')}
             </span>
           </TableHead>
           <TableHead>{t('Observed at')}</TableHead>
