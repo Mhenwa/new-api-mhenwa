@@ -30,6 +30,7 @@ const {
   createRootRoute,
   createRoute,
   createRouter,
+  RouterContextProvider,
   RouterProvider,
 } = await import('@tanstack/react-router')
 const { api } = await import('@/lib/api')
@@ -399,16 +400,33 @@ describe('API key expiry across editing sessions', () => {
       })
       renderedDrawer = { queryClient }
       const close = vi.fn()
+      const rootRoute = createRootRoute()
+      const router = createRouter({
+        routeTree: rootRoute.addChildren([
+          createRoute({
+            getParentRoute: () => rootRoute,
+            path: '/keys',
+          }),
+          createRoute({
+            getParentRoute: () => rootRoute,
+            path: '/channel-status',
+          }),
+        ]),
+        history: createMemoryHistory({ initialEntries: ['/keys'] }),
+      })
+      await router.load()
       const tree = (currentRow: ApiKey, open: boolean) => (
         <QueryClientProvider client={queryClient}>
           <I18nextProvider i18n={i18n}>
-            <ApiKeysProvider>
-              <ApiKeysMutateDrawer
-                open={open}
-                currentRow={currentRow}
-                onOpenChange={close}
-              />
-            </ApiKeysProvider>
+            <RouterContextProvider router={router}>
+              <ApiKeysProvider>
+                <ApiKeysMutateDrawer
+                  open={open}
+                  currentRow={currentRow}
+                  onOpenChange={close}
+                />
+              </ApiKeysProvider>
+            </RouterContextProvider>
           </I18nextProvider>
         </QueryClientProvider>
       )
