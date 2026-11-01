@@ -41,7 +41,7 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	a.started = true
 	ObserveResponsesOutcome(a.info, event)
 	switch event.Type {
-	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled", "error", "response.error":
 		if event.Response != nil {
 			ApplyResponsesUsage(a.usage, event.Response.Usage)
 			if a.outputText.Len() == 0 {
@@ -96,22 +96,24 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
-	if a.usage.CompletionTokens == 0 {
-		if output := a.outputText.String(); output != "" {
-			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
+	// An explicit upstream failure may follow partial output without any
+	// billable generation. Keep reported usage (including partial/zero counts),
+	// but never fill its missing tokens from local estimates in that case.
+	if !a.info.StreamStatus.ResponseFailed() {
+		if a.usage.CompletionTokens == 0 {
+			if output := a.outputText.String(); output != "" {
+				a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
+			}
+		}
+		billsPrompt := a.usage.CompletionTokens != 0 || a.started
+		if a.usage.PromptTokens == 0 && billsPrompt {
+			a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
+		}
+		if a.usage.BillingUsage != nil {
+			a.usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(a.usage.BillingUsage, a.usage.CompletionTokens)
 		}
 	}
-	// Upstream bills the prompt as soon as it starts generating, so a stream
-	// that produced any event but no usage still owes its input tokens unless
-	// upstream reported an explicit failure.
-	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt {
-		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
-	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
-	if a.usage.BillingUsage != nil {
-		a.usage.BillingUsage = dto.CloneBillingUsageWithEstimatedCompletion(a.usage.BillingUsage, a.usage.CompletionTokens)
-	}
 	return a.usage
 }
 

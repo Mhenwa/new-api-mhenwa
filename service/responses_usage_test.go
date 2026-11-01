@@ -1,13 +1,17 @@
 package service
 
 import (
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/tokenkit"
+	hosttypes "github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -79,7 +83,7 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 			name = "failed response preserves native billing usage"
 		}
 		t.Run(name, func(t *testing.T) {
-			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}, StreamStatus: relaycommon.NewStreamStatus()}
 			info.SetEstimatePromptTokens(100)
 			accumulator := NewResponsesUsageAccumulator(info)
 			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: "hello"}, nil)
@@ -89,24 +93,119 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 				accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.failed", Response: &dto.OpenAIResponsesResponse{Usage: upstream}}, nil)
 			}
 			usage := accumulator.Finish()
-			assert.Equal(t, 1, usage.CompletionTokens)
+			wantCompletion := 1
 			if withUsage {
+				wantCompletion = 0
 				assert.Equal(t, 20, usage.PromptTokens)
-				assert.Equal(t, 21, usage.TotalTokens)
+				assert.Equal(t, 20, usage.TotalTokens)
 				require.NotNil(t, usage.BillingUsage)
 				assert.Equal(t, dto.BillingUsageSourceOAIResponses, usage.BillingUsage.Source)
-				assert.True(t, usage.BillingUsage.Estimated)
+				assert.False(t, usage.BillingUsage.Estimated)
 				canonical, ok := usage.BillingUsage.CanonicalUsage()
 				require.True(t, ok)
 				assert.Equal(t, 4, canonical.PromptTokensDetails.CachedTokens)
-				assert.Equal(t, 1, canonical.CompletionTokens)
+				assert.Zero(t, canonical.CompletionTokens)
 			} else {
 				assert.Equal(t, 100, usage.PromptTokens)
 				assert.Equal(t, 101, usage.TotalTokens)
 			}
+			assert.Equal(t, wantCompletion, usage.CompletionTokens)
 			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: " late output"}, nil)
 			assert.Equal(t, usage, accumulator.Finish())
-			assert.Equal(t, 1, usage.CompletionTokens)
+			assert.Equal(t, wantCompletion, usage.CompletionTokens)
+		})
+	}
+}
+
+func TestResponsesUsageAccumulatorFailedResponseUsesOnlyUpstreamUsage(t *testing.T) {
+	const expression = `tier("test", p * 2 + cr * 0.5 + c * 10)`
+	for _, tc := range []struct {
+		name, terminal, deltaType  string
+		upstream                   *dto.Usage
+		billingSnapshot            bool
+		reportedBeforeError        bool
+		terminalOutputOnly         bool
+		wantPrompt, wantCompletion int
+		wantCache, wantQuota       int
+	}{
+		{name: "flat error after output", terminal: `{"type":"error","code":"server_error"}`},
+		{name: "response error after output", terminal: `{"type":"response.error"}`, deltaType: "response.function_call_arguments.delta"},
+		{name: "flat error with usage", terminal: `{"type":"error","response":{"usage":{"input_tokens":20,"output_tokens":3}}}`, wantPrompt: 20, wantCompletion: 3, wantQuota: 35},
+		{name: "response error with usage", terminal: `{"type":"response.error","response":{"usage":{"input_tokens":20,"output_tokens":3}}}`, wantPrompt: 20, wantCompletion: 3, wantQuota: 35},
+		{name: "failed response without usage", terminal: `{"type":"response.failed","response":{"status":"failed"}}`, deltaType: "response.reasoning_summary_text.delta"},
+		{name: "done alias with failed status", terminal: `{"type":"response.done","response":{"status":"failed"}}`, deltaType: "response.reasoning_text.delta"},
+		{name: "empty usage", upstream: &dto.Usage{}, deltaType: "response.refusal.delta"},
+		{name: "failed terminal output only", terminal: `{"type":"response.failed","response":{"status":"failed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}}`, terminalOutputOnly: true},
+		{name: "input usage only", upstream: &dto.Usage{InputTokens: 20}, wantPrompt: 20, wantQuota: 20},
+		{name: "output usage only", upstream: &dto.Usage{OutputTokens: 3}, wantCompletion: 3, wantQuota: 15},
+		{name: "native usage with cache", upstream: &dto.Usage{InputTokens: 20, OutputTokens: 5, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 4}}, wantPrompt: 20, wantCompletion: 5, wantCache: 4, wantQuota: 42},
+		{name: "billing snapshot with cache", upstream: &dto.Usage{InputTokens: 20, OutputTokens: 5, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 4}}, billingSnapshot: true, wantPrompt: 20, wantCompletion: 5, wantCache: 4, wantQuota: 42},
+		{name: "usage before later error", upstream: &dto.Usage{InputTokens: 20, OutputTokens: 5}, reportedBeforeError: true, wantPrompt: 20, wantCompletion: 5, wantQuota: 45},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &relaycommon.RelayInfo{
+				ChannelMeta:  &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"},
+				StreamStatus: relaycommon.NewStreamStatus(),
+				PriceData: hosttypes.PriceData{
+					ModelRatio: 1, CompletionRatio: 5, CacheRatio: 0.25,
+					GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+				},
+				TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+					BillingMode: "tiered_expr", ExprString: expression, ExprHash: billingexpr.ExprHashString(expression),
+					QuotaPerUnit: 500_000, GroupRatio: 1,
+				},
+			}
+			if tc.wantQuota == 0 {
+				// The incident used this group ratio: the old 128840/1
+				// estimate charged 83749 quota ($0.167498) instead of zero.
+				info.PriceData.GroupRatioInfo.GroupRatio = 0.65
+				info.TieredBillingSnapshot.GroupRatio = 0.65
+			}
+			info.SetEstimatePromptTokens(128840)
+			accumulator := NewResponsesUsageAccumulator(info)
+			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.created"}, nil)
+			if !tc.terminalOutputOnly {
+				deltaType := tc.deltaType
+				if deltaType == "" {
+					deltaType = "response.output_text.delta"
+				}
+				accumulator.Observe(&dto.ResponsesStreamResponse{Type: deltaType, Delta: "hello"}, nil)
+			}
+			var terminal dto.ResponsesStreamResponse
+			if tc.terminal != "" {
+				require.NoError(t, common.UnmarshalJsonStr(tc.terminal, &terminal))
+			} else {
+				if tc.billingSnapshot {
+					tc.upstream.BillingUsage = dto.NewOpenAIResponsesBillingUsage(tc.upstream)
+				}
+				terminal = dto.ResponsesStreamResponse{Type: "response.failed", Response: &dto.OpenAIResponsesResponse{Usage: tc.upstream}}
+			}
+			if tc.reportedBeforeError {
+				accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.completed", Response: terminal.Response}, nil)
+				terminal = dto.ResponsesStreamResponse{Type: "error", Code: "server_error"}
+			}
+			accumulator.Observe(&terminal, nil)
+			usage := accumulator.Finish()
+			assert.True(t, info.StreamStatus.ResponseFailed())
+			assert.Equal(t, tc.wantPrompt, usage.PromptTokens)
+			assert.Equal(t, tc.wantCompletion, usage.CompletionTokens)
+			assert.Equal(t, tc.wantPrompt+tc.wantCompletion, usage.TotalTokens)
+			assert.Equal(t, tc.wantCache, usage.PromptTokensDetails.CachedTokens)
+			if tc.billingSnapshot {
+				assert.Equal(t, tc.upstream.BillingUsage, usage.BillingUsage)
+			}
+
+			// Both pricing paths must see the reported usage, never the large
+			// prompt estimate or the small output delta that preceded the error.
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			billingUsage := effectiveBillingUsage(usage)
+			summary := calculateTextQuotaSummary(ctx, info, billingUsage)
+			assert.Equal(t, tc.wantQuota, summary.Quota)
+			params := BuildTieredTokenParams(billingUsage, false, billingexpr.UsedVarsByHash(expression, info.TieredBillingSnapshot.ExprHash))
+			ok, quota, _ := TryTieredSettle(info, params)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantQuota, quota)
+			assert.Same(t, usage, accumulator.Finish())
 		})
 	}
 }
