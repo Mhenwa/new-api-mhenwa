@@ -1,6 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
+# Read directly by Docker's Linux build stages.
+VERSION text eol=lf
+
 # Go files
 *.go text eol=lf
 
