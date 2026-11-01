@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,7 +15,17 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-const sampleTTL = 24 * time.Hour
+const (
+	sampleTTL                      = 24 * time.Hour
+	activeRequestLeaseTTL          = 2 * time.Minute
+	activeRequestHeartbeatInterval = 30 * time.Second
+)
+
+var (
+	activeOwnerIDMu sync.Mutex
+	activeOwnerID   string
+	activeRequests  sync.Map
+)
 
 type Sample struct {
 	ID                string  `json:"id,omitempty"`
@@ -56,14 +67,64 @@ else
   redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
 redis.call('ZADD', KEYS[2], ARGV[1], ARGV[3])
-redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[4])
+local legacy = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[4])
+for _, member in ipairs(legacy) do
+  if not string.find(member, string.char(0), 1, true) then
+    redis.call('ZREM', KEYS[2], member)
+  end
+end
+local clock = redis.call('TIME')
+local nowMS = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('ZADD', KEYS[5], nowMS, ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[2])
+redis.call('EXPIRE', KEYS[5], ARGV[2])
+return 1
+`)
+
+var refreshActiveRequestLeaseScript = redis.NewScript(`
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) or
+   not redis.call('ZSCORE', KEYS[2], ARGV[1]) then
+  return 0
+end
+local clock = redis.call('TIME')
+local nowMS = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('ZADD', KEYS[2], nowMS, ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
 redis.call('EXPIRE', KEYS[2], ARGV[2])
 return 1
+`)
+
+var finishActiveRequestScript = redis.NewScript(`
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+return removed
+`)
+
+var clearStaleActiveRequestsScript = redis.NewScript(`
+local clock = redis.call('TIME')
+local nowMS = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local members = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
+for index = 1, #members, 2 do
+  local member = members[index]
+  local stale = false
+  if string.find(member, string.char(0), 1, true) then
+    local lease = redis.call('ZSCORE', KEYS[2], member)
+    stale = not lease or tonumber(lease) <= nowMS - tonumber(ARGV[1])
+  else
+    stale = tonumber(members[index + 1]) <= tonumber(ARGV[2])
+  end
+  if stale then
+    redis.call('ZREM', KEYS[1], member)
+    redis.call('ZREM', KEYS[2], member)
+  end
+end
+return redis.call('ZCARD', KEYS[1])
 `)
 
 var newerSampleScript = redis.NewScript(`
 if ARGV[5] == 'real' and ARGV[7] ~= '' then
   redis.call('ZREM', KEYS[6], ARGV[7])
+  redis.call('ZREM', KEYS[7], ARGV[7])
 end
 local current = redis.call('GET', KEYS[1])
 local updateLatest = true
@@ -162,11 +223,23 @@ func MarkRequestStarted(group, model string, tokenID int, requestID string, at t
 	if requestID == "" {
 		return errors.New("channel status request ID is required")
 	}
+	ownerID, err := currentActiveOwnerID()
+	if err != nil {
+		return err
+	}
+	member := activeRequestMember(ownerID, requestID)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	startKey := redisKey(group, model, "real-start")
 	activeKey := redisKey(group, model, "real-active")
-	return maxStartScript.Run(ctx, common.RDB, []string{startKey, activeKey, redisKey(group, model, "probe-lock"), redisKey(group, model, "probe-cancel")}, at.UnixMilli(), int64(sampleTTL.Seconds()), requestID, at.Add(-sampleTTL).UnixMilli()).Err()
+	if err := maxStartScript.Run(ctx, common.RDB, []string{
+		startKey, activeKey, redisKey(group, model, "probe-lock"), redisKey(group, model, "probe-cancel"),
+		activeRequestLeasesKey(group, model),
+	}, at.UnixMilli(), int64(sampleTTL.Seconds()), member, time.Now().Add(-sampleTTL).UnixMilli()).Err(); err != nil {
+		return err
+	}
+	startActiveRequestHeartbeat(group, model, requestID, member)
+	return nil
 }
 
 func RecordRealSample(group, model string, tokenID int, sample Sample) error {
@@ -190,18 +263,25 @@ func RecordRealSample(group, model string, tokenID int, sample Sample) error {
 }
 
 func MarkRequestFinished(group, model, requestID string) {
+	stopActiveRequestHeartbeat(group, model, requestID)
 	if !RedisAvailable() || requestID == "" {
+		return
+	}
+	ownerID, err := currentActiveOwnerID()
+	if err != nil {
 		return
 	}
 	// The caller retains the groups/models it registered. Cleanup must survive
 	// an administrator removing a target while its request is still running.
 	client := common.RDB
-	key := redisKey(group, model, "real-active")
+	member := activeRequestMember(ownerID, requestID)
 	gopool.Go(func() {
 		var err error
 		for range 2 {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err = client.ZRem(ctx, key, requestID).Err()
+			err = finishActiveRequestScript.Run(ctx, client, []string{
+				redisKey(group, model, "real-active"), activeRequestLeasesKey(group, model),
+			}, member).Err()
 			cancel()
 			if err == nil {
 				return
@@ -209,6 +289,84 @@ func MarkRequestFinished(group, model, requestID string) {
 		}
 		common.SysLog(common.LogText("channel status active request cleanup failed: %v", err))
 	})
+}
+
+func currentActiveOwnerID() (string, error) {
+	activeOwnerIDMu.Lock()
+	defer activeOwnerIDMu.Unlock()
+	if activeOwnerID != "" {
+		return activeOwnerID, nil
+	}
+	var identity [16]byte
+	if _, err := rand.Read(identity[:]); err != nil {
+		return "", err
+	}
+	activeOwnerID = hex.EncodeToString(identity[:])
+	return activeOwnerID, nil
+}
+
+func activeRequestMember(ownerID, requestID string) string {
+	// Scope each marker to a process lifetime, including when nodes reuse a
+	// request ID. A restarted process must never finish another node's request.
+	return ownerID + "\x00" + requestID
+}
+
+func activeRequestHeartbeatKey(group, model, requestID string) string {
+	return targetKey(group, model) + "\x00" + requestID
+}
+
+func activeRequestLeasesKey(group, model string) string {
+	return redisKey(group, model, "real-active-leases")
+}
+
+func startActiveRequestHeartbeat(group, model, requestID, member string) {
+	heartbeatKey := activeRequestHeartbeatKey(group, model, requestID)
+	stop := make(chan struct{})
+	if _, loaded := activeRequests.LoadOrStore(heartbeatKey, stop); loaded {
+		return
+	}
+	gopool.Go(func() {
+		defer activeRequests.CompareAndDelete(heartbeatKey, stop)
+		ticker := time.NewTicker(activeRequestHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if !RedisAvailable() {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				active, err := refreshActiveRequestLease(ctx, group, model, member)
+				cancel()
+				if err == nil && !active {
+					return
+				}
+			}
+		}
+	})
+}
+
+func stopActiveRequestHeartbeat(group, model, requestID string) {
+	if value, loaded := activeRequests.LoadAndDelete(activeRequestHeartbeatKey(group, model, requestID)); loaded {
+		close(value.(chan struct{}))
+	}
+}
+
+func refreshActiveRequestLease(ctx context.Context, group, model, member string) (bool, error) {
+	result, err := refreshActiveRequestLeaseScript.Run(ctx, common.RDB, []string{
+		redisKey(group, model, "real-active"), activeRequestLeasesKey(group, model),
+	}, member, int64(sampleTTL.Seconds())).Int64()
+	return result == 1, err
+}
+
+func clearStaleActiveRequests(ctx context.Context, group, model string, now time.Time) (int64, error) {
+	// Lease times use Redis's clock so B/D clock skew cannot remove a live
+	// request. Legacy markers have no heartbeat and retain the old 24h grace.
+	return clearStaleActiveRequestsScript.Run(ctx, common.RDB, []string{
+		redisKey(group, model, "real-active"), activeRequestLeasesKey(group, model),
+	}, activeRequestLeaseTTL.Milliseconds(), now.Add(-sampleTTL).UnixMilli()).Int64()
 }
 
 func RecordProbeSample(group, model string, sample Sample) error {
@@ -247,6 +405,7 @@ func writeSample(parent context.Context, group, model, source string, sample Sam
 		redisKey(group, model, "observations"), redisKey(group, model, "real-samples"),
 		redisKey(group, model, "observation-data"),
 		redisKey(group, model, "real-active"),
+		activeRequestLeasesKey(group, model),
 	}, data, sample.OrderMS, int64(sampleTTL.Seconds()), time.Now().Unix()/60, source, int64((sampleTTL + time.Hour).Seconds()), sample.activeRequestID).Err()
 }
 
