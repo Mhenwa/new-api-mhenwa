@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -69,6 +70,17 @@ func appendRequestPath(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other
 func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other *model.LogOther) {
 	if ctx == nil || other == nil {
 		return
+	}
+	if ctx.Request != nil {
+		if audit := relaytrace.FromContext(ctx.Request.Context()); audit != nil {
+			if attempt := audit.CurrentAttempt(); attempt != nil && relayInfo != nil && relayInfo.StreamStatus != nil {
+				status := relayInfo.StreamStatus
+				attempt.SetStreamResult(string(status.EndReason), status.ResponseOutcome(), relayInfo.ReceivedResponseCount)
+			}
+			// This is a snapshot at log creation. A separate final audit event
+			// records writes that happen after settlement (notably WS terminals).
+			other.SetAdmin("relay_audit", audit.Snapshot())
+		}
 	}
 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
 	if relayInfo != nil {

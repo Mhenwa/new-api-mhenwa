@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -511,6 +512,9 @@ func TestUpstreamGetBody_HTTP2RetryAfterUpstreamStreamReset_PassThrough(t *testi
 	ApplyUpstreamBodyMetadata(req, body)
 	require.NotNil(t, req.GetBody)
 	assert.EqualValues(t, len(payload), req.ContentLength)
+	audit := relaytrace.New("local-h2-retry", "", "test-node", http.MethodPost, "/v1/chat/completions", "127.0.0.1", nil)
+	attempt := audit.BeginAttempt(88, req.Method, req.URL.String(), "http")
+	req = attempt.TraceRequest(req)
 
 	resp, err := client.Do(req)
 	require.NoError(t, err, "the transport must transparently retry a pass-through body after RST_STREAM")
@@ -523,6 +527,10 @@ func TestUpstreamGetBody_HTTP2RetryAfterUpstreamStreamReset_PassThrough(t *testi
 	require.Len(t, srv.attemptBodies, 2)
 	assert.Equal(t, payload, srv.attemptBodies[0])
 	assert.Equal(t, payload, srv.attemptBodies[1])
+	snapshot := audit.Snapshot()
+	require.Len(t, snapshot.Attempts, 1)
+	assert.EqualValues(t, 2*len(payload), snapshot.Attempts[0].RequestBytesRead)
+	assert.Equal(t, 2, snapshot.Attempts[0].TransportWrites)
 }
 
 func TestUpstreamGetBody_HTTP2RetryAfterGracefulGoAway_PassThrough(t *testing.T) {

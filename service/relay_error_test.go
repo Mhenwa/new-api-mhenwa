@@ -13,6 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -277,4 +279,36 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	other := model.NewLogOther()
 	AppendRelayLogAdminInfo(untouched, nil, other)
 	assert.NotContains(t, other.Snapshot()["admin_info"], "request_policy", "requests without decisions do not carry an empty record")
+}
+
+func TestRelayAuditSnapshotReachesLogAdminInfo(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	audit := relaytrace.New("local-request", "edge-request", "node-b", http.MethodPost, "/v1/responses", "127.0.0.1:1234", nil)
+	c.Request = c.Request.WithContext(relaytrace.WithContext(c.Request.Context(), audit))
+	attempt := audit.BeginAttempt(88, http.MethodPost, "https://provider.example/v1/responses?key=secret", "http")
+	attempt.ReceiveResponse(&http.Response{StatusCode: http.StatusOK, Header: http.Header{"X-Request-Id": []string{"provider-request"}}})
+	status := relaycommon.NewStreamStatus()
+	status.SetEndReason(relaycommon.StreamEndReasonClientGone, errors.New("cancelled"))
+	other := model.NewLogOther()
+	AppendRelayLogAdminInfo(c, &relaycommon.RelayInfo{IsStream: true, StreamStatus: status, ReceivedResponseCount: 3}, other)
+	encoded := other.JSONString()
+	var metadata struct {
+		AdminInfo struct {
+			RelayAudit relaytrace.Snapshot `json:"relay_audit"`
+		} `json:"admin_info"`
+	}
+	require.NoError(t, common.UnmarshalJsonStr(encoded, &metadata))
+	assert.NotContains(t, other.Snapshot(), "relay_audit", "transport details must stay in the admin scope")
+	assert.Equal(t, "local-request", metadata.AdminInfo.RelayAudit.RequestID)
+	require.Len(t, metadata.AdminInfo.RelayAudit.Attempts, 1)
+	assert.Equal(t, "provider-request", metadata.AdminInfo.RelayAudit.Attempts[0].PrimaryID)
+	assert.Equal(t, "client_gone", metadata.AdminInfo.RelayAudit.Attempts[0].EndReason)
+	assert.Equal(t, 3, metadata.AdminInfo.RelayAudit.Attempts[0].ReceivedEvents)
+	assert.NotContains(t, encoded, "secret")
+	// A log snapshot cannot grow another attempt or change when the live
+	// request later emits its final transport audit event.
+	audit.BeginAttempt(89, http.MethodPost, "https://other.example", "http")
+	audit.Finish(http.StatusOK)
+	assert.Equal(t, encoded, other.JSONString())
 }

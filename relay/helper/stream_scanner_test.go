@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -119,6 +120,15 @@ func setupStreamTest(t *testing.T, body io.Reader) (*gin.Context, *http.Response
 	}
 
 	return c, resp, info
+}
+
+func attachStreamAudit(c *gin.Context, resp *http.Response) *relaytrace.Trace {
+	trace := relaytrace.New("local-request", "edge-request", "test-node", c.Request.Method,
+		c.Request.URL.Path, c.Request.RemoteAddr, nil)
+	c.Request = c.Request.WithContext(relaytrace.WithContext(c.Request.Context(), trace))
+	attempt := trace.BeginAttempt(88, c.Request.Method, "https://upstream.example/v1/responses", "http")
+	attempt.ReceiveResponse(resp)
+	return trace
 }
 
 func buildSSEBody(n int) string {
@@ -306,6 +316,7 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
 
 	resp := &http.Response{Body: pr}
+	trace := attachStreamAudit(c, resp)
 	info := &relaycommon.RelayInfo{
 		DisablePing: true,
 		ChannelMeta: &relaycommon.ChannelMeta{},
@@ -356,6 +367,73 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 	body := recorder.Body.String()
 	assert.Contains(t, body, "first")
 	assert.NotContains(t, body, "second")
+
+	snapshot := trace.Snapshot()
+	require.Len(t, snapshot.Attempts, 1)
+	attempt := snapshot.Attempts[0]
+	assert.True(t, attempt.BodyClosed)
+	assert.Equal(t, "client_gone", attempt.EndReason)
+	for _, observation := range attempt.Observations {
+		assert.NotEqual(t, "upstream_body_read", observation.Stage,
+			"closing upstream during cancellation must not look like a provider read failure")
+	}
+}
+
+func TestStreamScannerAuditUpstreamReadFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = reader.Close() })
+	require.NoError(t, writer.CloseWithError(io.ErrUnexpectedEOF))
+	c, resp, info := setupStreamTest(t, reader)
+	resp.Body = reader
+	info.DisablePing = true
+	trace := attachStreamAudit(c, resp)
+
+	StreamScannerHandler(c, resp, info, func(string, *StreamResult) {})
+
+	assert.Equal(t, relaycommon.StreamEndReasonScannerErr, info.StreamStatus.EndReason)
+	snapshot := trace.Snapshot()
+	require.Len(t, snapshot.Attempts, 1)
+	stages := make(map[string]string)
+	for _, observation := range snapshot.Attempts[0].Observations {
+		stages[observation.Stage] = observation.ErrorClass
+	}
+	assert.Equal(t, "unexpected_eof", stages["upstream_body_read"])
+	assert.NotContains(t, stages, "upstream_body_read_after_close")
+	assert.Equal(t, "scanner_error", snapshot.Attempts[0].EndReason)
+}
+
+func TestStreamScannerAuditCompletionSurvivesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	c, resp, info := setupStreamTest(t, reader)
+	c.Request = c.Request.WithContext(ctx)
+	resp.Body = reader
+	info.DisablePing = true
+	trace := attachStreamAudit(c, resp)
+	go func() {
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_completed\",\"usage\":{}}}\n")
+	}()
+
+	StreamScannerHandler(c, resp, info, func(_ string, result *StreamResult) {
+		info.StreamStatus.MarkCompleted()
+		result.Done()
+		cancel()
+	})
+
+	snapshot := trace.Snapshot()
+	require.Len(t, snapshot.Attempts, 1)
+	attempt := snapshot.Attempts[0]
+	assert.Equal(t, "resp_completed", attempt.ResponseObjectID)
+	assert.Equal(t, "response.completed", attempt.TerminalEvent)
+	assert.Equal(t, "completed", attempt.ResponseOutcome)
+	assert.Equal(t, "done", attempt.EndReason)
+	assert.True(t, attempt.UsageObjectObserved)
+	assert.True(t, attempt.BodyClosed)
 }
 
 // ---------- Ping tests ----------

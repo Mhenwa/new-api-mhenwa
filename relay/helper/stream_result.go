@@ -3,6 +3,7 @@ package helper
 import (
 	"errors"
 
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
@@ -12,6 +13,7 @@ import (
 // StreamScannerHandler checks IsStopped() after each callback invocation.
 type StreamResult struct {
 	status  *relaycommon.StreamStatus
+	trace   *relaytrace.Trace
 	stopped bool
 	done    bool
 }
@@ -26,6 +28,7 @@ func (r *StreamResult) Error(err error) {
 	if err == nil {
 		return
 	}
+	r.trace.Observe("stream_handler", err)
 	r.status.RecordError(err.Error())
 	var apiErr *types.NewAPIError
 	if errors.As(err, &apiErr) {

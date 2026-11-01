@@ -17,10 +17,12 @@ import (
 	appconstant "github.com/QuantumNous/new-api/constant"
 	appdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	appmodel "github.com/QuantumNous/new-api/model"
 	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -84,6 +86,7 @@ type responsesWSCallState struct {
 	controls chan responsesWSControl
 	done     chan struct{}
 	terminal *responsesWSMessage
+	audit    *relaytrace.Trace
 	// A nonzero closeCode ends the connection after this request.
 	closeCode   int
 	closeReason string
@@ -145,6 +148,7 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 	for {
 		_, message, err := client.ReadMessage()
 		if err != nil {
+			relaytrace.FromContext(c.Request.Context()).Observe("downstream_websocket_read", err)
 			return nil
 		}
 		envelope, streamID, err := parseResponsesWSEnvelope(message)
@@ -183,6 +187,16 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 }
 
 func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []byte, envelope responsesWSCreateEvent, streamID string, requestID string) {
+	auditContext := context.WithValue(s.ctx, common.RequestIdKey, requestID)
+	if relaytrace.Enabled() {
+		state.audit = relaytrace.New(requestID, s.request.Header.Get(relaytrace.EdgeRequestIDHeader), common.NodeName,
+			"WS", "/v1/responses", s.request.RemoteAddr, func(event relaytrace.Event) {
+				if data, err := common.Marshal(event); err == nil {
+					logger.LogInfo(auditContext, "relay_audit "+string(data))
+				}
+			})
+	}
+	state.audit.AddInboundBytes(len(message))
 	create, parseErr := normalizeResponsesWSCreateEvent(message, envelope, streamID)
 	var apiErr *types.NewAPIError
 	var upstreamURLs []string
@@ -190,6 +204,9 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		if recovered := recover(); recovered != nil {
 			apiErr = types.NewError(fmt.Errorf("responses websocket request panic: %v", recovered), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			state.closeCode = websocket.CloseInternalServerErr
+		}
+		if apiErr != nil {
+			state.audit.Observe("relay_response", apiErr)
 		}
 		// Finish the middleware count before publishing the terminal event. Hold
 		// admission while writing it so an immediate next create cannot race
@@ -206,9 +223,13 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		s.stateMu.Lock()
 		if outgoing != nil {
 			if err := s.client.SetWriteDeadline(s.clientWriteBudget.Deadline(time.Now(), len(outgoing.body))); err != nil {
+				state.audit.Observe("downstream_write_deadline", err)
 				state.closeCode = websocket.CloseInternalServerErr
 			} else if err := s.client.WriteMessage(outgoing.kind, outgoing.body); err != nil {
+				state.audit.Observe("downstream_write", err)
 				state.closeCode = websocket.CloseInternalServerErr
+			} else {
+				state.audit.AddDownstreamBytes(len(outgoing.body))
 			}
 		}
 		if state.closeCode != 0 {
@@ -218,8 +239,14 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		close(state.done)
 		s.stateMu.Unlock()
 		s.clientWriteMu.Unlock()
+		if attempt := state.audit.CurrentAttempt(); attempt != nil {
+			attempt.End()
+		}
+		// The HTTP transport was upgraded once; protocol errors are separate
+		// observations and must not be represented as a new HTTP response.
+		state.audit.Finish(http.StatusSwitchingProtocols)
 	}()
-	request := s.request.Clone(s.ctx)
+	request := s.request.Clone(relaytrace.WithContext(auditContext, state.audit))
 	request.Body = io.NopCloser(bytes.NewReader(message))
 	request.ContentLength = int64(len(message))
 	request.Header.Set("Content-Type", "application/json")
@@ -316,9 +343,15 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if apiErr != nil {
 			return apiErr
 		}
+		state.audit.BeginAttempt(info.ChannelId, "WS", common.GetContextKeyString(c, appconstant.ContextKeyUpstreamRequestOrigin), "websocket")
+		state.audit.Observe("websocket_reused_connection", nil)
 		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
+			state.audit.Observe("upstream_write", err)
 			state.closeCode = websocket.CloseInternalServerErr
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+		}
+		if attempt := state.audit.CurrentAttempt(); attempt != nil {
+			attempt.AddRequestBytes(len(payload))
 		}
 	} else {
 		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
@@ -369,9 +402,16 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			if !s.setTarget(target) {
 				return types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
+			// The HTTP handshake has its own completed audit attempt. Each
+			// response.create is a distinct logical request on that connection.
+			state.audit.BeginAttempt(info.ChannelId, "WS", common.GetContextKeyString(c, appconstant.ContextKeyUpstreamRequestOrigin), "websocket")
 			if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
+				state.audit.Observe("upstream_write", err)
 				state.closeCode = websocket.CloseInternalServerErr
 				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+			}
+			if attempt := state.audit.CurrentAttempt(); attempt != nil {
+				attempt.AddRequestBytes(len(payload))
 			}
 			s.lockedModel, s.lockedChannelID, s.lockedGroup = modelName, channel.Id, info.UsingGroup
 			s.lockedKey, s.lockedKeyIndex = info.ApiKey, info.ChannelMultiKeyIndex
@@ -418,10 +458,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		case incoming := <-state.inbox:
 			idle.Reset(timeout)
 			if incoming.err != nil {
+				state.audit.Observe("upstream_body_read", incoming.err)
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, incoming.err)
 				state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream connection closed"
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
+			}
+			if attempt := state.audit.CurrentAttempt(); attempt != nil {
+				attempt.AddUpstreamBytes(len(incoming.body))
 			}
 			info.SetFirstResponseTime()
 			var event struct {
@@ -433,7 +477,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			} else {
 				if event.Type != "error" && event.StreamID != "" && event.StreamID != create.StreamID {
 					if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+						state.audit.Observe("downstream_write", err)
 						s.shutdown(websocket.CloseInternalServerErr, "")
+					} else {
+						state.audit.AddDownstreamBytes(len(incoming.body))
 					}
 					continue
 				}
@@ -451,7 +498,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					terminal, ambiguous, controlError := responsesWSErrorEndsRequest(rejection, create.StreamID, responseID, sentControl)
 					if !terminal {
 						if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+							state.audit.Observe("downstream_write", err)
 							s.shutdown(websocket.CloseInternalServerErr, "")
+						} else {
+							state.audit.AddDownstreamBytes(len(incoming.body))
 						}
 						// Only a control error in this stream resolves its pending control.
 						if controlError {
@@ -460,6 +510,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						continue
 					}
 					if accepted {
+						if attempt := state.audit.CurrentAttempt(); attempt != nil {
+							attempt.ObserveSSE(string(incoming.body))
+						}
 						if rejection.Error != nil {
 							code := ""
 							if rejection.Error.Code != nil {
@@ -483,6 +536,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 						rejection.Error = &types.OpenAIError{Type: "invalid_request_error", Message: event.Message, Code: event.Code}
 					}
 					rejected := types.WithOpenAIError(*rejection.Error, rejection.Status, types.ErrOptionWithSkipRetry())
+					if attempt := state.audit.CurrentAttempt(); attempt != nil {
+						attempt.ObserveSSE(string(incoming.body))
+					}
 					if rejected.StatusCode < 400 || rejected.StatusCode > 599 {
 						rejected.StatusCode = http.StatusBadRequest
 					}
@@ -501,6 +557,9 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				if info.ChannelStatusOutput != nil {
 					info.ChannelStatusOutput.Observe(incoming.body, time.Now())
 				}
+				if attempt := state.audit.CurrentAttempt(); attempt != nil {
+					attempt.ObserveSSE(string(incoming.body))
+				}
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
 			}
 			switch event.Type {
@@ -514,11 +573,17 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				return nil
 			}
 			if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+				state.audit.Observe("downstream_write", err)
 				s.shutdown(websocket.CloseInternalServerErr, "")
+			} else {
+				state.audit.AddDownstreamBytes(len(incoming.body))
 			}
 			if accepted && pendingControl != nil {
 				if err := s.writeTarget(websocket.TextMessage, pendingControl); err != nil {
+					state.audit.Observe("upstream_write", err)
 					s.shutdown(websocket.CloseInternalServerErr, "")
+				} else if attempt := state.audit.CurrentAttempt(); attempt != nil {
+					attempt.AddRequestBytes(len(pendingControl))
 				}
 				sentControl = pendingControl
 				pendingControl = nil
@@ -533,15 +598,20 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				continue
 			}
 			if err := s.writeTarget(websocket.TextMessage, control.body); err != nil {
+				state.audit.Observe("upstream_write", err)
 				s.shutdown(websocket.CloseInternalServerErr, "")
+			} else if attempt := state.audit.CurrentAttempt(); attempt != nil {
+				attempt.AddRequestBytes(len(control.body))
 			}
 			sentControl = control.body
 		case <-idle.C:
+			state.audit.Observe("local_stream_timeout", context.DeadlineExceeded)
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)
 			state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream response timed out"
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil
 		case <-s.ctx.Done():
+			state.audit.Observe("downstream_context", s.ctx.Err())
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, s.ctx.Err())
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil

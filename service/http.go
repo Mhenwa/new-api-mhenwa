@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 
 	"github.com/gin-gonic/gin"
 )
@@ -26,15 +27,17 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 // ShouldCopyUpstreamHeader checks whether a given upstream response header
 // should be copied to the client response. It returns false for Content-Length
 // (managed separately) and X-Oneapi-Request-Id (to preserve the local instance
-// ID). When the upstream header is X-Oneapi-Request-Id, the value is captured
-// into the Gin context for later logging.
+// ID). Keep a fallback for adaptors which copy headers outside the common
+// transport, without overriding the transport's chosen provider request ID.
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
 	if strings.EqualFold(k, "Content-Length") {
 		return false
 	}
 	if strings.EqualFold(k, common.RequestIdKey) {
-		if c != nil && len(v) > 0 {
-			c.Set(common.UpstreamRequestIdKey, v[0])
+		if c != nil && c.GetString(common.UpstreamRequestIdKey) == "" {
+			if id := relaytrace.PrimaryRequestID(http.Header{k: v}); id != "" {
+				c.Set(common.UpstreamRequestIdKey, id)
+			}
 		}
 		return false
 	}
@@ -45,6 +48,9 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 	if c.Writer == nil {
 		return
 	}
+	if c.Request != nil && len(data) <= 512<<10 {
+		relaytrace.FromContext(c.Request.Context()).CurrentAttempt().ObserveSSE(string(data))
+	}
 
 	body := io.NopCloser(bytes.NewBuffer(data))
 
@@ -53,6 +59,9 @@ func IOCopyBytesGracefully(c *gin.Context, src *http.Response, data []byte) {
 	// So the httpClient will be confused by the response.
 	// For example, Postman will report error, and we cannot check the response at all.
 	if src != nil {
+		if c.GetString(common.UpstreamRequestIdKey) == "" {
+			c.Set(common.UpstreamRequestIdKey, relaytrace.PrimaryRequestID(src.Header))
+		}
 		for k, v := range src.Header {
 			if !ShouldCopyUpstreamHeader(c, k, v) {
 				continue

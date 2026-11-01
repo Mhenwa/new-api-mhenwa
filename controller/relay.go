@@ -19,6 +19,7 @@ import (
 	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -93,6 +94,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
+			if audit := relaytrace.FromContext(c.Request.Context()); audit != nil {
+				audit.Observe("relay_response", newAPIError)
+			}
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
@@ -230,6 +234,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
+		// A retry can fail before reaching the transport (URL/header setup).
+		// Never attribute the preceding provider's ID to that failure.
+		c.Set(common.UpstreamRequestIdKey, "")
+		relaytrace.FromContext(c.Request.Context()).ClearCurrentAttempt()
 
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
@@ -240,6 +248,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = geminiRelayHandler(c, relayInfo)
 		default:
 			newAPIError = relayHandler(c, relayInfo)
+		}
+		if audit := relaytrace.FromContext(c.Request.Context()); audit != nil {
+			if newAPIError != nil {
+				audit.Observe("relay_response", newAPIError)
+			}
+			if attempt := audit.CurrentAttempt(); attempt != nil {
+				if status := relayInfo.StreamStatus; status != nil {
+					attempt.SetStreamResult(string(status.EndReason), status.ResponseOutcome(), relayInfo.ReceivedResponseCount)
+				}
+				attempt.End()
+			}
 		}
 
 		if newAPIError == nil {

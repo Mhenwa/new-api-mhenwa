@@ -35,6 +35,22 @@ func TestFormatUserLogsStripsQuotaSaturation(t *testing.T) {
 	require.Contains(t, parsed, "model_price")
 }
 
+func TestRelayAuditVisibilityIsRoleSeparated(t *testing.T) {
+	other := NewLogOther()
+	other.SetPublic("request_path", "/v1/responses")
+	other.SetAdmin("relay_audit", map[string]any{
+		"peer":     "192.0.2.1:443",
+		"attempts": []map[string]any{{"channel_id": 88, "primary_request_id": "provider-private-id"}},
+	})
+	userLogs := []*Log{{Other: other.JSONString()}}
+	formatUserLogs(userLogs, 0)
+	assert.JSONEq(t, `{"request_path":"/v1/responses"}`, userLogs[0].Other)
+	adminLogs := []*Log{{Other: other.JSONString()}}
+	FormatAdminLogs(adminLogs)
+	assert.Contains(t, adminLogs[0].Other, "relay_audit")
+	assert.Contains(t, adminLogs[0].Other, "provider-private-id")
+}
+
 func TestTaskPluginLogVisibilityIsRoleSeparated(t *testing.T) {
 	other := common.MapToJsonStr(map[string]any{
 		"model_price": 1.25,

@@ -16,6 +16,7 @@ import (
 	appdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -557,6 +558,51 @@ func TestResponsesWSMessageSizeLimit(t *testing.T) {
 		t.Fatal("websocket request did not exit after oversized message")
 	}
 	assert.False(t, admitted.Load())
+}
+
+func TestResponsesWSAuditIncludesTerminalWriteFailure(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			t.Setenv("RELAY_AUDIT_ENABLED", fmt.Sprint(enabled))
+			_, server, cleanup := newTestWebSocketPair(t)
+			defer cleanup()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			terminal := []byte(`{"type":"response.completed","response":{"id":"resp_terminal","status":"completed"}}`)
+			state := &responsesWSCallState{done: make(chan struct{})}
+			session := &responsesWSSession{ctx: ctx, cancel: cancel, client: server, current: state,
+				request: httptest.NewRequest(http.MethodGet, "/v1/responses", nil)}
+			session.runner = func(request *http.Request, requestID string, _ func(*gin.Context) *types.NewAPIError) *types.NewAPIError {
+				assert.Same(t, state.audit, relaytrace.FromContext(request.Context()))
+				if state.audit != nil {
+					attempt := state.audit.BeginAttempt(7, "WS", "https://upstream.example", "websocket")
+					attempt.ObserveSSE(string(terminal))
+				}
+				state.terminal = &responsesWSMessage{kind: websocket.TextMessage, body: terminal}
+				// Closing the local socket deterministically makes the subsequent
+				// terminal delivery fail, after the request runner has succeeded.
+				require.NoError(t, server.Close())
+				return nil
+			}
+			message := []byte(`{"type":"response.create","model":"test","input":"hi"}`)
+			envelope, streamID, err := parseResponsesWSEnvelope(message)
+			require.NoError(t, err)
+			session.runRequest(state, message, envelope, streamID, "session-ws-1")
+			if !enabled {
+				assert.Nil(t, state.audit)
+				return
+			}
+			require.NotNil(t, state.audit)
+			snapshot := state.audit.Snapshot()
+			assert.Equal(t, "session-ws-1", snapshot.RequestID)
+			assert.Zero(t, snapshot.DownstreamBytes, "a failed write must not claim delivery")
+			require.NotNil(t, snapshot.EndedAt)
+			require.Len(t, snapshot.Observations, 1)
+			assert.Equal(t, "downstream_write", snapshot.Observations[0].Stage)
+			require.Len(t, snapshot.Attempts, 1)
+			assert.Equal(t, "resp_terminal", snapshot.Attempts[0].ResponseObjectID)
+		})
+	}
 }
 
 func TestResponsesWSShutdownInterruptsBusyWriter(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	common2 "github.com/QuantumNous/new-api/common"
 	appconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -383,11 +384,15 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 // request context, and reports a rejected handshake as a *types.NewAPIError
 // carrying the upstream status code (types.NewError preserves it).
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	// A retry must not inherit a different upstream's request ID.
+	c.Set(common2.UpstreamRequestIdKey, "")
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	fullRequestURL = toWebSocketURL(fullRequestURL)
+	attempt := relaytrace.FromContext(c.Request.Context()).BeginAttempt(info.GetChannelID(), http.MethodGet, fullRequestURL, "websocket_handshake")
+	defer attempt.End()
 	if targetURL, parseErr := url.Parse(fullRequestURL); parseErr == nil {
 		common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, targetURL.Scheme+"://"+targetURL.Host)
 	}
@@ -418,7 +423,14 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		dialer.TLSClientConfig = common2.InsecureTLSConfig
 	}
 	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
+	// Rejected handshakes also carry provider IDs and must be captured before
+	// their body is closed. This describes the handshake, not later WS turns.
+	attempt.ReceiveResponse(resp)
+	if resp != nil {
+		c.Set(common2.UpstreamRequestIdKey, relaytrace.PrimaryRequestID(resp.Header))
+	}
 	if err != nil {
+		attempt.Fail("upstream_websocket_handshake", err)
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
 			statusCode = resp.StatusCode
@@ -455,8 +467,13 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	c.Set(common2.UpstreamRequestIdKey, "")
+	attempt := relaytrace.FromContext(c.Request.Context()).BeginAttempt(info.GetChannelID(), req.Method, req.URL.String(), "http")
+	req = attempt.TraceRequest(req)
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
+		attempt.Fail("local_http_client_setup", err)
+		attempt.End()
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
 	// Clients are cached and shared across channels, so override redirect
@@ -487,11 +504,19 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
+	attempt.ReceiveResponse(resp)
+	if resp != nil {
+		c.Set(common2.UpstreamRequestIdKey, relaytrace.PrimaryRequestID(resp.Header))
+	}
 	if err != nil {
+		attempt.Fail("upstream_round_trip", err)
+		attempt.End()
 		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
+		attempt.Fail("upstream_response_headers", errors.New("nil response"))
+		attempt.End()
 		return nil, errors.New("resp is nil")
 	}
 	if common2.DebugEnabled {
@@ -502,10 +527,6 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			policy.Shards,
 			policy.String(),
 			resp.Proto)
-	}
-
-	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
-		c.Set(common2.UpstreamRequestIdKey, upID)
 	}
 
 	_ = req.Body.Close()

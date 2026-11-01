@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	channelstatus "github.com/QuantumNous/new-api/pkg/channel_status"
+	"github.com/QuantumNous/new-api/pkg/relaytrace"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -529,6 +530,7 @@ func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, 
 }
 
 func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
+	t.Setenv("RELAY_AUDIT_ENABLED", "true")
 	type upstreamRequest struct {
 		Authorization      string
 		Type               string `json:"type"`
@@ -614,6 +616,33 @@ func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
 		assert.Equal(t, fmt.Sprintf("responses-ws-billing-ws-%d", index), logs[index].RequestId)
 		assert.Equal(t, 1000, logs[index].PromptTokens)
 		assert.Equal(t, 10, logs[index].CompletionTokens)
+		var metadata struct {
+			AdminInfo struct {
+				RelayAudit relaytrace.Snapshot `json:"relay_audit"`
+			} `json:"admin_info"`
+		}
+		require.NoError(t, common.UnmarshalJsonStr(logs[index].Other, &metadata))
+		audit := metadata.AdminInfo.RelayAudit
+		assert.Equal(t, logs[index].RequestId, audit.RequestID)
+		if index == 0 {
+			require.Len(t, audit.Attempts, 2, "the first create preserves a separate handshake attempt")
+			assert.Equal(t, http.StatusSwitchingProtocols, audit.Attempts[0].Status)
+			require.NotNil(t, audit.Attempts[0].EndedAt)
+			assert.False(t, audit.Attempts[1].StartedAt.Before(*audit.Attempts[0].EndedAt), "logical request begins after the handshake")
+		} else {
+			require.Len(t, audit.Attempts, 1, "reuse cannot inherit an earlier request's attempts")
+		}
+		logical := audit.Attempts[len(audit.Attempts)-1]
+		assert.Equal(t, fixture.channel.Id, logical.ChannelID)
+		assert.Equal(t, fmt.Sprintf("resp_%d", index+1), logical.ResponseObjectID)
+		assert.Equal(t, "response.completed", logical.TerminalEvent)
+		assert.Equal(t, "completed", logical.ResponseOutcome)
+		assert.Empty(t, logical.PrimaryID, "a response object ID is not a provider request UUID")
+		if index == 1 {
+			require.Len(t, audit.Observations, 1)
+			assert.Equal(t, "websocket_reused_connection", audit.Observations[0].Stage)
+			assert.Nil(t, logical.HeadersAt, "reuse must not fabricate a new HTTP handshake")
+		}
 	}
 	// Routing decisions are persisted per request: the first create selects a
 	// channel, later creates on the same connection reuse it as a pin.
