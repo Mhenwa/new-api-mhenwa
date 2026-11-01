@@ -150,6 +150,14 @@ func RecordRelayResult(info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
 	}
 	outputTokens := max(int64(0), info.PerformanceOutputTokens)
 	observationID := ""
+	activeOwnerID := ""
+	activeRequestID := ""
+	if info.RequestId != "" {
+		activeOwnerID, _ = currentActiveOwnerID()
+		if activeOwnerID != "" {
+			activeRequestID = activeRequestMember(activeOwnerID, info.RequestId)
+		}
+	}
 	if info.RequestId != "" {
 		identity := sha256.Sum256([]byte("real:" + info.RequestId))
 		observationID = hex.EncodeToString(identity[:])
@@ -157,6 +165,6 @@ func RecordRelayResult(info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
 	_ = RecordRealSample(info.UsingGroup, info.OriginModelName, info.TokenId, Sample{
 		ID: observationID, Status: status, ObservedAt: now.Unix(), OrderMS: now.UnixMilli(), StartedAt: started.Unix(), TTFTMs: ttftMs,
 		LatencyMs: latencyMs, TPS: tps, OutputTokens: &outputTokens, OutputRateVersion: outputRateVersion,
-		activeRequestID: info.RequestId,
+		activeRequestID: activeRequestID,
 	})
 }

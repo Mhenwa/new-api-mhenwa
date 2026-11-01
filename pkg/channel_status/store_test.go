@@ -2,6 +2,7 @@ package channelstatus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -127,17 +128,34 @@ func TestRequestMarkerLifecycleAndProbeCancellation(t *testing.T) {
 	require.NoError(t, common.RDB.Set(context.Background(), lockKey, "probe-owner", time.Minute).Err())
 
 	require.NoError(t, MarkRequestStarted(target.Group, target.Model, 7, "request-1", started))
-	active, err := common.RDB.ZScore(context.Background(), redisKey(target.Group, target.Model, "real-active"), "request-1").Result()
+	ownerID, err := currentActiveOwnerID()
+	require.NoError(t, err)
+	member := activeRequestMember(ownerID, "request-1")
+	active, err := common.RDB.ZScore(context.Background(), redisKey(target.Group, target.Model, "real-active"), member).Result()
 	require.NoError(t, err)
 	assert.Equal(t, float64(started.UnixMilli()), active)
+	assert.Positive(t, common.RDB.ZScore(context.Background(), activeRequestLeasesKey(target.Group, target.Model), member).Val())
 	cancelValue, err := common.RDB.Get(context.Background(), cancelKey).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "probe-owner", cancelValue)
 
+	// Another process may receive the same client request ID. Finishing this
+	// process's request must leave the other node's marker and lease intact.
+	remoteMember := activeRequestMember("another-node", "request-1")
+	activeKey := redisKey(target.Group, target.Model, "real-active")
+	leasesKey := activeRequestLeasesKey(target.Group, target.Model)
+	require.NoError(t, common.RDB.ZAdd(context.Background(), activeKey, &redis.Z{Score: float64(started.UnixMilli()), Member: remoteMember}).Err())
+	require.NoError(t, common.RDB.ZAdd(context.Background(), leasesKey, &redis.Z{Score: float64(time.Now().UnixMilli()), Member: remoteMember}).Err())
 	MarkRequestFinished(target.Group, target.Model, "request-1")
 	require.Eventually(t, func() bool {
-		return common.RDB.ZCard(context.Background(), redisKey(target.Group, target.Model, "real-active")).Val() == 0
+		return errors.Is(common.RDB.ZScore(context.Background(), activeKey, member).Err(), redis.Nil)
 	}, time.Second, time.Millisecond)
+	assert.ErrorIs(t, common.RDB.ZScore(context.Background(), leasesKey, member).Err(), redis.Nil)
+	require.NoError(t, common.RDB.ZScore(context.Background(), activeKey, remoteMember).Err())
+	require.NoError(t, common.RDB.ZScore(context.Background(), leasesKey, remoteMember).Err())
+	stillActive, err := refreshActiveRequestLease(context.Background(), target.Group, target.Model, member)
+	require.NoError(t, err)
+	assert.False(t, stillActive, "completion must win over any later heartbeat")
 }
 
 func TestProbeTokenIsNeverMarkedAsRealRequest(t *testing.T) {
@@ -689,13 +707,15 @@ func TestCompletedRealObservationAtomicallyClearsOnlyItsOwnActiveMarker(t *testi
 	setupChannelStatusStore(t)
 	target := testTarget()
 	base := time.Now()
+	ownerID, err := currentActiveOwnerID()
+	require.NoError(t, err)
 	require.NoError(t, MarkRequestStarted(target.Group, target.Model, 7, "private-request-a", base))
 	require.NoError(t, MarkRequestStarted(target.Group, target.Model, 7, "private-request-b", base))
 	sample := Sample{ID: "opaque-a", Status: "healthy", ObservedAt: base.Unix(), OrderMS: base.UnixMilli(),
-		TTFTMs: 100, LatencyMs: 200, activeRequestID: "private-request-a"}
+		TTFTMs: 100, LatencyMs: 200, activeRequestID: activeRequestMember(ownerID, "private-request-a")}
 	require.NoError(t, writeSample(context.Background(), target.Group, target.Model, "real", sample))
 	assert.Equal(t, int64(1), common.RDB.ZCard(context.Background(), redisKey(target.Group, target.Model, "real-active")).Val())
-	require.NoError(t, common.RDB.ZScore(context.Background(), redisKey(target.Group, target.Model, "real-active"), "private-request-b").Err())
+	require.NoError(t, common.RDB.ZScore(context.Background(), redisKey(target.Group, target.Model, "real-active"), activeRequestMember(ownerID, "private-request-b")).Err())
 	payload := common.RDB.HGet(context.Background(), redisKey(target.Group, target.Model, "observation-data"), "opaque-a").Val()
 	assert.NotContains(t, payload, "private-request-a", "public observation data must never expose raw request IDs")
 	// A duplicate completion still cleans its marker without a duplicate bar.

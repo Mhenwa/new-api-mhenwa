@@ -70,19 +70,19 @@ func (dispatcher *probeDispatcher) dispatch(targets []Target, run func(context.C
 func targetNeedsProbe(parent context.Context, target Target, now time.Time) (bool, error) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
+	activeCount, err := clearStaleActiveRequests(ctx, target.Group, target.Model, now)
+	if err != nil {
+		return false, err
+	}
+	if activeCount > 0 {
+		return false, nil
+	}
 	pipe := common.RDB.Pipeline()
 	real := pipe.Get(ctx, redisKey(target.Group, target.Model, "real"))
 	probe := pipe.Get(ctx, redisKey(target.Group, target.Model, "probe"))
 	lastCheck := pipe.Get(ctx, redisKey(target.Group, target.Model, "last-check"))
-	active := pipe.ZCard(ctx, redisKey(target.Group, target.Model, "real-active"))
 	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
 		return false, err
-	}
-	if active.Err() != nil {
-		return false, active.Err()
-	}
-	if active.Val() > 0 {
-		return false, nil
 	}
 	latest := int64(0)
 	for _, result := range []*redis.StringCmd{real, probe} {
